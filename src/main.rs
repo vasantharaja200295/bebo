@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! wisp: a GPU terminal emulator. See docs/PLAN.md.
+//! bebo: a GPU terminal emulator. See docs/PLAN.md.
 
 mod pty;
 mod render;
@@ -195,7 +195,7 @@ impl Region {
         let grid = term.grid();
         let cols = grid.columns();
         // ponytail: the line number is wrong after a clear-screen or when the scrollback is full.
-        // Then the region check fails and wisp works as a usual terminal. Fix: track the mark in the grid.
+        // Then the region check fails and bebo works as a usual terminal. Fix: track the mark in the grid.
         let start = Point::new(Line(abs_line - grid.history_size() as i32), Column(col));
         let cursor_point = grid.cursor.point;
         if cursor_point < start || start.line.0 < -(grid.history_size() as i32) {
@@ -338,7 +338,7 @@ impl App {
             input_start: None,
             await_input: false,
             cwd,
-            title: "wisp".into(),
+            title: "bebo".into(),
             blocks: Vec::new(),
         };
         self.panes.insert(id, pane);
@@ -440,24 +440,24 @@ impl App {
         self.relayout();
         self.draw();
 
-        // Test aid: WISP_TEST=tde runs these commands at start (t: tab, d: split right, e: split down, f: search).
-        for command in std::env::var("WISP_TEST").unwrap_or_default().chars() {
+        // Test aid: BEBO_TEST=tde runs these commands at start (t: tab, d: split right, e: split down, f: search).
+        for command in std::env::var("BEBO_TEST").unwrap_or_default().chars() {
             match command {
                 't' => self.new_tab(),
                 'd' => self.split(true),
                 'e' => self.split(false),
                 'f' => {
-                    self.search = Some("wisp".into());
+                    self.search = Some("bebo".into());
                     self.relayout();
                 },
                 _ => {},
             }
         }
 
-        if std::env::var_os("WISP_TIMING").is_some() {
+        if std::env::var_os("BEBO_TIMING").is_some() {
             let gpu = self.gpu.as_ref().unwrap();
             render::tick(self.start, &format!("first frame, adapter: {}", gpu.adapter_name));
-            let _ = std::fs::write(std::env::temp_dir().join("wisp-timing.txt"), &*render::TIMING.lock().unwrap());
+            let _ = std::fs::write(std::env::temp_dir().join("bebo-timing.txt"), &*render::TIMING.lock().unwrap());
         }
     }
 
@@ -905,7 +905,7 @@ impl App {
         let has_selection =
             self.panes.get(&focus).is_some_and(|p| p.term.lock().selection.as_ref().is_some_and(|s| !s.is_empty()));
 
-        // wisp commands.
+        // bebo commands.
         let handled = match (ctrl, shift, alt, character.as_str(), &key) {
             (true, true, false, "t", _) => self.new_tab(),
             (true, true, false, "w", _) => self.close_pane(focus, event_loop),
@@ -1044,9 +1044,9 @@ impl App {
         match mark {
             Mark::InputStart => {
                 pane.await_input = true;
-                if std::env::var_os("WISP_TIMING").is_some() {
+                if std::env::var_os("BEBO_TIMING").is_some() {
                     render::tick(self.start, "shell prompt");
-                    let _ = std::fs::write(std::env::temp_dir().join("wisp-timing.txt"), &*render::TIMING.lock().unwrap());
+                    let _ = std::fs::write(std::env::temp_dir().join("bebo-timing.txt"), &*render::TIMING.lock().unwrap());
                 }
             },
             Mark::Exec => {
@@ -1080,7 +1080,7 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let attributes = Window::default_attributes().with_title("wisp").with_inner_size(LogicalSize::new(1000.0, 640.0));
+        let attributes = Window::default_attributes().with_title("bebo").with_inner_size(LogicalSize::new(1000.0, 640.0));
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
         // The window shows immediately with the background color. The GPU frame comes when the device is ready.
         paint_background(&window);
@@ -1269,7 +1269,7 @@ fn draw_pane(frame: &mut Frame, pane: &Pane, rect: Rect, focused: bool, cw: f32,
     }
 }
 
-/// Fills the window with the background color through GDI. wisp uses this before the GPU is ready.
+/// Fills the window with the background color through GDI. bebo uses this before the GPU is ready.
 fn paint_background(window: &Window) {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, GetDC, ReleaseDC};

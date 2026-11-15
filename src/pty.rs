@@ -183,13 +183,13 @@ pub fn spawn_shell(
     cwd: Option<PathBuf>,
 ) -> io::Result<EventLoopSender> {
     let mut env = fresh_env();
-    env.insert("TERM_PROGRAM".into(), "wisp".into());
+    env.insert("TERM_PROGRAM".into(), "bebo".into());
     env.insert("COLORTERM".into(), "truecolor".into());
 
     let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("path")).map(|(_, v)| v.as_str());
     let program = find_shell(path.unwrap_or(""));
     // The script has no double quotes and no comments in the code part, so one line is safe.
-    let script: String = include_str!("shell/wisp.ps1")
+    let script: String = include_str!("shell/bebo.ps1")
         .lines()
         .filter(|l| !l.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
@@ -220,7 +220,7 @@ fn find_shell(path: &str) -> String {
 }
 
 /// Reads the environment variables from the registry.
-/// A new shell then sees a `PATH` that an installer changed after wisp started.
+/// A new shell then sees a `PATH` that an installer changed after bebo started.
 fn fresh_env() -> HashMap<String, String> {
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};

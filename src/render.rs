@@ -72,14 +72,14 @@ pub struct Device {
 pub fn init_device(t0: std::time::Instant) -> Device {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     // OpenGL is the default: on the test PC it starts in about 250 ms and uses about 90 MB.
-    // DirectX 12 needs about 600 ms and 160 MB, because wgpu examines each adapter. Set WISP_BACKEND=dx12 to use it.
-    descriptor.backends = match std::env::var("WISP_BACKEND").as_deref() {
+    // DirectX 12 needs about 600 ms and 160 MB, because wgpu examines each adapter. Set BEBO_BACKEND=dx12 to use it.
+    descriptor.backends = match std::env::var("BEBO_BACKEND").as_deref() {
         Ok("dx12") => wgpu::Backends::DX12,
         _ => wgpu::Backends::GL,
     };
     let instance = wgpu::Instance::new(descriptor);
-    // The dedicated GPU is the default. Set WISP_GPU=low to use the integrated GPU.
-    let power_preference = match std::env::var("WISP_GPU").as_deref() {
+    // The dedicated GPU is the default. Set BEBO_GPU=low to use the integrated GPU.
+    let power_preference = match std::env::var("BEBO_GPU").as_deref() {
         Ok("low") => wgpu::PowerPreference::LowPower,
         _ => wgpu::PowerPreference::HighPerformance,
     };
@@ -182,7 +182,7 @@ impl Gpu {
         let vertices = Self::vertex_buffer(&device, vertex_capacity);
 
         tick(t0, "pipeline");
-        // Load only the fonts that wisp uses. A scan of all system fonts is slow.
+        // Load only the fonts that bebo uses. A scan of all system fonts is slow.
         let mut db = fontdb::Database::new();
         for file in ["CascadiaMono.ttf", "consola.ttf", "consolab.ttf", "seguisym.ttf", "seguiemj.ttf"] {
             let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
@@ -399,7 +399,7 @@ impl Gpu {
     }
 }
 
-/// Start-up timing log. `main` writes it to a file if WISP_TIMING is set.
+/// Start-up timing log. `main` writes it to a file if BEBO_TIMING is set.
 pub static TIMING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 pub fn tick(start: std::time::Instant, label: &str) {

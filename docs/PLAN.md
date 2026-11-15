@@ -1,6 +1,6 @@
-# wisp: build plan (primary version)
+# bebo: build plan (primary version)
 
-wisp is a GPU terminal emulator for Windows 11, written in Rust.
+bebo is a GPU terminal emulator for Windows 11, written in Rust.
 This doc is the plan for the primary version. The learning version has its own doc: [LEARNING-GUIDE.md](LEARNING-GUIDE.md).
 
 ## 1. Decisions
@@ -9,10 +9,10 @@ This doc is the plan for the primary version. The learning version has its own d
 |---|---|
 | Scope | Terminal emulator only. Zed is the editor. No built-in file editor, LSP, or Tree-sitter. |
 | Platform | Windows 11 first. All crates are cross-platform, so Linux and macOS stay possible. |
-| Line editing | Shell integration. The shell owns the command line. wisp changes mouse actions into keys. |
+| Line editing | Shell integration. The shell owns the command line. bebo changes mouse actions into keys. |
 | Formatted output | Command blocks, clickable links, colored error lines. JSON and table rendering come later. |
-| GPU | wgpu. The default backend is OpenGL on the dedicated GPU, because it starts faster (section 8). `WISP_BACKEND=dx12` selects DirectX 12. `WISP_GPU=low` selects the integrated GPU with DirectX 12. |
-| Binary | One self-contained `wisp.exe`. It uses the Windows fonts Cascadia Mono or Consolas. |
+| GPU | wgpu. The default backend is OpenGL on the dedicated GPU, because it starts faster (section 8). `BEBO_BACKEND=dx12` selects DirectX 12. `BEBO_GPU=low` selects the integrated GPU with DirectX 12. |
+| Binary | One self-contained `bebo.exe`. It uses the Windows fonts Cascadia Mono or Consolas. |
 
 ## 2. Speed budgets
 
@@ -23,11 +23,11 @@ These numbers are the pass/fail limits for each release.
 | Time from process start to first frame | 100 ms |
 | Time from process start to shell spawn | 20 ms (the shell starts before the GPU is ready) |
 | Key press to pixel change | 1 frame |
-| CPU when idle | 0 % (wisp draws only when something changes) |
+| CPU when idle | 0 % (bebo draws only when something changes) |
 | RAM with one tab and 10 000 scrollback lines | 80 MB |
 | `cat` of a 100 MB log file | No freeze. Input stays responsive. |
 
-Rules that keep wisp fast:
+Rules that keep bebo fast:
 
 - Start the shell before the window. Start the GPU on a second thread at process start.
 - Show the window immediately with the background color. Draw the first GPU frame when the device is ready.
@@ -70,7 +70,7 @@ Source files:
 | `main.rs` | Start-up order, event loop, input, keybindings, tabs, split panes, click-to-edit (`Region`). |
 | `pty.rs` | Spawn the shell, reader thread, OSC 133 scan, restart. |
 | `render.rs` | wgpu surface, text rows, rectangles (cursor, selection, tab bar). |
-| `shell/wisp.ps1` | Shell integration script for PowerShell. |
+| `shell/bebo.ps1` | Shell integration script for PowerShell. |
 
 ## 4. Feature design
 
@@ -81,29 +81,29 @@ Problem: in a usual terminal, you press arrow keys to go to a word in a long com
 Design:
 
 1. The shell integration script prints OSC 133 marks. Mark `B` shows where the command text starts.
-2. wisp knows the cell of mark `B` and the cell of the cursor. The cells between are the command line.
-3. **Click** in the command line: wisp counts the cells from the cursor to the click. wisp sends that number of Left or Right keys.
-4. **Drag** in the command line: wisp shows a selection.
-5. **Type** with a selection: wisp moves the cursor to the selection end, sends Backspace for each selected cell, then sends the typed text.
+2. bebo knows the cell of mark `B` and the cell of the cursor. The cells between are the command line.
+3. **Click** in the command line: bebo counts the cells from the cursor to the click. bebo sends that number of Left or Right keys.
+4. **Drag** in the command line: bebo shows a selection.
+5. **Type** with a selection: bebo moves the cursor to the selection end, sends Backspace for each selected cell, then sends the typed text.
 6. **Delete or Backspace** with a selection: same as step 5 with no text.
 7. **Ctrl+Z / Ctrl+Y** on the command line: the shell line editor does undo and redo (PSReadLine, readline).
 
 A click outside the command line does the usual terminal selection.
-If the shell has no integration, wisp works as a usual terminal.
+If the shell has no integration, bebo works as a usual terminal.
 
-Limit: wisp counts cells, not characters. A double-width character or a multi-line command can put the cursor one cell off. Fix this later with a per-cell width count.
+Limit: bebo counts cells, not characters. A double-width character or a multi-line command can put the cursor one cell off. Fix this later with a per-cell width count.
 
 ### 4.2 Restart command
 
 Use: after an install from the command line, the new `PATH` must be visible.
 
 - Keybinding: `Ctrl+Shift+R`.
-- Typed command: `restart`. The integration script defines it. It prints a private escape sequence (`OSC 7717 ; restart`). wisp sees it and restarts the session.
+- Typed command: `restart`. The integration script defines it. It prints a private escape sequence (`OSC 7717 ; restart`). bebo sees it and restarts the session.
 
 Restart does these steps:
 
 1. Stop the shell of the focused pane.
-2. Read a new environment block from the registry (system and user variables). Do not copy the old environment of wisp.
+2. Read a new environment block from the registry (system and user variables). Do not copy the old environment of bebo.
 3. Start the same shell in the same directory. ConPTY clears the visible screen when the new shell starts.
 
 Step 2 is the important one. Without it, the new shell gets the old `PATH`.
@@ -129,7 +129,7 @@ Step 2 is the important one. Without it, the new shell gets the old `PATH`.
 
 ### 4.6 Formatted output
 
-- **Command blocks**: OSC 133 marks give the start and end of each command. wisp draws a thin separator above each prompt.
+- **Command blocks**: OSC 133 marks give the start and end of each command. bebo draws a thin separator above each prompt.
 - A command that takes 1 second or more shows its duration at the right side of its prompt line.
 - `Ctrl+Shift+Up/Down` jumps between prompts.
 - **Links**: `Ctrl+Click` opens an http(s) URL or a file path that exists. `file.rs:12:5` opens `file.rs`. OSC 8 hyperlinks also work.
@@ -156,9 +156,9 @@ Step 2 is the important one. Without it, the new shell gets the old `PATH`.
 
 ## 5. Checklist mapping
 
-The checklist describes an editor. This table shows what each item means for wisp.
+The checklist describes an editor. This table shows what each item means for bebo.
 
-| Checklist item | In wisp | Phase |
+| Checklist item | In bebo | Phase |
 |---|---|---|
 | Instant startup | Speed budgets, shell starts first | 1 |
 | Low resource footprint | Event-driven draw, fixed scrollback limit | 1, 6 |
@@ -167,11 +167,11 @@ The checklist describes an editor. This table shows what each item means for wis
 | Predictable keybindings | Desktop shortcuts (4.7) | 2 |
 | System clipboard | `arboard`, bracketed paste | 2 |
 | Mouse support | Click-to-edit, scroll, selection, divider drag, mouse reporting to apps | 2, 3, 4 |
-| Syntax highlighting | Shell does it (PSReadLine colors). wisp colors error blocks. | 5 |
+| Syntax highlighting | Shell does it (PSReadLine colors). bebo colors error blocks. | 5 |
 | Regex search and replace | Regex search in scrollback. Replace on command line by selection. | 5 |
 | Split panes and tabs | 4.3, 4.4 | 4 |
 | Undo/redo | Shell line editor on the command line | 3 |
-| Easy installation | One `wisp.exe` | 6 |
+| Easy installation | One `bebo.exe` | 6 |
 | LSP, Tree-sitter, plugins | Out of scope. Zed does this. | none |
 
 ## 6. Phases
@@ -194,11 +194,11 @@ Each phase ends with a binary that works.
 | `glyphon` is too slow for a full-screen redraw | Per-row cache first. If a frame takes more than 4 ms, write a cell-grid glyph atlas renderer. |
 | The dedicated GPU is slow to wake up on a laptop | Measure first-frame time. Add the low-power setting. |
 | ConPTY changes or delays some escape sequences | Test OSC 133 through ConPTY in phase 3 before other work. |
-| A slow PowerShell profile makes the prompt late | wisp cannot fix this. wisp shows the window immediately so the delay is visible as shell time. |
+| A slow PowerShell profile makes the prompt late | bebo cannot fix this. bebo shows the window immediately so the delay is visible as shell time. |
 
 ## 8. Status (2026-11-15)
 
-Build: `cargo build --release`. The binary is `target/release/wisp.exe` (7.8 MB).
+Build: `cargo build --release`. The binary is `target/release/bebo.exe` (7.8 MB).
 
 ### Done and tested on this PC
 
@@ -210,7 +210,7 @@ Build: `cargo build --release`. The binary is `target/release/wisp.exe` (7.8 MB)
 | Click moves the cursor in the command line | Works |
 | Drag selection in the command line, typed text replaces it | Works |
 | `restart` command gives a new environment | Works. A new user variable was visible after `restart`. |
-| On-demand tab bar, split panes, focus outline | Works (drawn with the `WISP_TEST` aid) |
+| On-demand tab bar, split panes, focus outline | Works (drawn with the `BEBO_TEST` aid) |
 | 60 000 lines of output | No freeze. Input stays responsive. |
 | Command blocks: separators, red bar and `exit N` for a failed command, duration | Works |
 | Unit tests (`cargo test`) | 5 pass |
@@ -263,7 +263,7 @@ To reach 100 ms, replace `wgpu` with direct Direct3D 11 calls. This is a large c
 
 | Variable | Effect |
 |---|---|
-| `WISP_TIMING=1` | Writes start-up step times to `%TEMP%\wisp-timing.txt`. |
-| `WISP_TEST=tdef` | Runs commands at start: `t` tab, `d` split right, `e` split down, `f` search. |
-| `WISP_BACKEND=dx12` | Uses DirectX 12. |
-| `WISP_GPU=low` | Uses the integrated GPU (DirectX 12 only). |
+| `BEBO_TIMING=1` | Writes start-up step times to `%TEMP%\bebo-timing.txt`. |
+| `BEBO_TEST=tdef` | Runs commands at start: `t` tab, `d` split right, `e` split down, `f` search. |
+| `BEBO_BACKEND=dx12` | Uses DirectX 12. |
+| `BEBO_GPU=low` | Uses the integrated GPU (DirectX 12 only). |
