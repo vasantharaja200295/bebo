@@ -175,26 +175,89 @@ impl OnResize for Tap {
     }
 }
 
+/// A shell that bebo can start.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Profile {
+    Pwsh,
+    PowerShell,
+    Cmd,
+    Wsl,
+}
+
+impl Profile {
+    pub const ALL: [Profile; 4] = [Profile::Pwsh, Profile::PowerShell, Profile::Cmd, Profile::Wsl];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Profile::Pwsh => "PowerShell 7",
+            Profile::PowerShell => "Windows PowerShell 5.1",
+            Profile::Cmd => "Command Prompt",
+            Profile::Wsl => "WSL",
+        }
+    }
+
+    /// Short text for the square badge in a tab.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Profile::Pwsh | Profile::PowerShell => "PS",
+            Profile::Cmd => ">_",
+            Profile::Wsl => "Lx",
+        }
+    }
+
+    fn program(self) -> &'static str {
+        match self {
+            Profile::Pwsh => "pwsh.exe",
+            Profile::PowerShell => "powershell.exe",
+            Profile::Cmd => "cmd.exe",
+            Profile::Wsl => "wsl.exe",
+        }
+    }
+
+    /// The profiles that are installed on this PC.
+    pub fn available() -> Vec<Profile> {
+        let path = std::env::var("PATH").unwrap_or_default();
+        Profile::ALL.into_iter().filter(|p| find_program(&path, p.program()).is_some()).collect()
+    }
+
+    /// PowerShell 7 if it is installed. If not, Windows PowerShell.
+    pub fn default_profile() -> Profile {
+        let path = std::env::var("PATH").unwrap_or_default();
+        if find_program(&path, "pwsh.exe").is_some() { Profile::Pwsh } else { Profile::PowerShell }
+    }
+}
+
 /// Starts a shell on a new ConPTY. The shell writes into `term`.
+/// `banner` is "SGR code|text". The PowerShell script prints it above the first prompt.
 pub fn spawn_shell(
     term: SharedTerm,
     proxy: Proxy,
     size: WindowSize,
     cwd: Option<PathBuf>,
+    profile: Profile,
+    banner: Option<String>,
 ) -> io::Result<EventLoopSender> {
     let mut env = fresh_env();
     env.insert("TERM_PROGRAM".into(), "bebo".into());
     env.insert("COLORTERM".into(), "truecolor".into());
+    if let Some(banner) = banner {
+        env.insert("BEBO_BANNER".into(), banner);
+    }
 
-    let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("path")).map(|(_, v)| v.as_str());
-    let program = find_shell(path.unwrap_or(""));
-    // The script has no double quotes and no comments in the code part, so one line is safe.
-    let script: String = include_str!("shell/bebo.ps1")
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let args = ["-NoLogo", "-NoExit", "-Command", &script].map(String::from).to_vec();
+    let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("path")).map(|(_, v)| v.clone()).unwrap_or_default();
+    let program = find_program(&path, profile.program()).unwrap_or_else(|| profile.program().to_string());
+    let args = match profile {
+        Profile::Pwsh | Profile::PowerShell => {
+            // The script has no double quotes and no comments in the code part, so one line is safe.
+            let script: String = include_str!("shell/bebo.ps1")
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join(" ");
+            ["-NoLogo", "-NoExit", "-Command", &script].map(String::from).to_vec()
+        },
+        Profile::Cmd | Profile::Wsl => Vec::new(),
+    };
 
     let options = Options {
         shell: Some(Shell::new(program, args)),
@@ -211,12 +274,11 @@ pub fn spawn_shell(
     Ok(tx)
 }
 
-fn find_shell(path: &str) -> String {
+fn find_program(path: &str, program: &str) -> Option<String> {
     path.split(';')
-        .map(|dir| PathBuf::from(dir.trim()).join("pwsh.exe"))
+        .map(|dir| PathBuf::from(dir.trim()).join(program))
         .find(|p| p.is_file())
         .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "powershell.exe".into())
 }
 
 /// Reads the environment variables from the registry.

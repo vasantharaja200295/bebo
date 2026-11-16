@@ -1,0 +1,130 @@
+//! Colors for the window and the text. One Dark and One Light.
+
+pub type Rgb = [u8; 3];
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Theme {
+    pub dark: bool,
+    pub name: &'static str,
+    /// Terminal background.
+    pub bg: Rgb,
+    /// Title bar background.
+    pub bar: Rgb,
+    /// Popup background.
+    pub panel: Rgb,
+    /// Selected row in a popup, and the active tab.
+    pub panel_hi: Rgb,
+    pub border: Rgb,
+    pub fg: Rgb,
+    /// Secondary text.
+    pub dim: Rgb,
+    pub accent: Rgb,
+    pub red: Rgb,
+    pub yellow: Rgb,
+    pub green: Rgb,
+    pub cyan: Rgb,
+    pub selection: Rgb,
+    /// Background of a find match.
+    pub find: Rgb,
+    /// The 16 ANSI colors.
+    pub ansi: [Rgb; 16],
+}
+
+pub const ONE_DARK: Theme = Theme {
+    dark: true,
+    name: "One Dark",
+    bg: [0x28, 0x2c, 0x34],
+    bar: [0x21, 0x25, 0x2b],
+    panel: [0x21, 0x25, 0x2b],
+    panel_hi: [0x2c, 0x31, 0x3a],
+    border: [0x3e, 0x44, 0x51],
+    fg: [0xc8, 0xcc, 0xd4],
+    dim: [0x7f, 0x84, 0x8e],
+    accent: [0x61, 0xaf, 0xef],
+    red: [0xe0, 0x6c, 0x75],
+    yellow: [0xe5, 0xc0, 0x7b],
+    green: [0x98, 0xc3, 0x79],
+    cyan: [0x56, 0xb6, 0xc2],
+    selection: [0x3e, 0x44, 0x51],
+    find: [0x6b, 0x5a, 0x3a],
+    ansi: [
+        [0x3f, 0x44, 0x51],
+        [0xe0, 0x6c, 0x75],
+        [0x98, 0xc3, 0x79],
+        [0xd1, 0x9a, 0x66],
+        [0x61, 0xaf, 0xef],
+        [0xc6, 0x78, 0xdd],
+        [0x56, 0xb6, 0xc2],
+        [0xab, 0xb2, 0xbf],
+        [0x7f, 0x84, 0x8e],
+        [0xe0, 0x6c, 0x75],
+        [0x98, 0xc3, 0x79],
+        [0xe5, 0xc0, 0x7b],
+        [0x61, 0xaf, 0xef],
+        [0xc6, 0x78, 0xdd],
+        [0x56, 0xb6, 0xc2],
+        [0xff, 0xff, 0xff],
+    ],
+};
+
+pub const ONE_LIGHT: Theme = Theme {
+    dark: false,
+    name: "One Light",
+    bg: [0xfa, 0xfa, 0xfa],
+    bar: [0xec, 0xec, 0xed],
+    panel: [0xff, 0xff, 0xff],
+    panel_hi: [0xe5, 0xe5, 0xe6],
+    border: [0xd0, 0xd0, 0xd2],
+    fg: [0x38, 0x3a, 0x42],
+    dim: [0x69, 0x6c, 0x77],
+    accent: [0x40, 0x78, 0xf2],
+    red: [0xe4, 0x56, 0x49],
+    yellow: [0xc1, 0x84, 0x01],
+    green: [0x50, 0xa1, 0x4f],
+    cyan: [0x01, 0x84, 0xbc],
+    selection: [0xd7, 0xdc, 0xe8],
+    find: [0xf2, 0xdc, 0xa0],
+    ansi: [
+        [0x38, 0x3a, 0x42],
+        [0xe4, 0x56, 0x49],
+        [0x50, 0xa1, 0x4f],
+        [0x98, 0x68, 0x01],
+        [0x40, 0x78, 0xf2],
+        [0xa6, 0x26, 0xa4],
+        [0x01, 0x84, 0xbc],
+        // "White" must be dark on a light background.
+        [0x38, 0x3a, 0x42],
+        [0x69, 0x6c, 0x77],
+        [0xe4, 0x56, 0x49],
+        [0x50, 0xa1, 0x4f],
+        [0xc1, 0x84, 0x01],
+        [0x40, 0x78, 0xf2],
+        [0xa6, 0x26, 0xa4],
+        [0x01, 0x84, 0xbc],
+        [0x10, 0x12, 0x16],
+    ],
+};
+
+impl Theme {
+    /// Color for an index of the terminal color table (0..269).
+    pub fn palette(&self, index: usize) -> Rgb {
+        match index {
+            0..=15 => self.ansi[index],
+            16..=231 => {
+                let i = index - 16;
+                let level = |n: usize| if n == 0 { 0 } else { (55 + 40 * n) as u8 };
+                [level(i / 36), level(i / 6 % 6), level(i % 6)]
+            },
+            232..=255 => [(8 + 10 * (index - 232)) as u8; 3],
+            257 | 268 => self.bg,
+            258 => self.accent,
+            259..=266 => mix(self.ansi[index - 259], self.bg, 0.4),
+            _ => self.fg,
+        }
+    }
+}
+
+/// Mixes `a` with `b`. `t` is the part of `b`.
+pub fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    [0, 1, 2].map(|i| (a[i] as f32 * (1.0 - t) + b[i] as f32 * t) as u8)
+}

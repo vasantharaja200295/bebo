@@ -1,4 +1,5 @@
 # bebo shell integration for PowerShell 5.1 and 7.
+# After a resize, PSReadLine has a wrong row for the prompt. bebo then sends Ctrl+F12, and the key handler draws the prompt again at the cursor row.
 # bebo sends this file as one line. End each statement with ";". Do not use double quotes or comments in the code part.
 $global:__bebo_e = [string][char]27;
 $global:__bebo_b = [string][char]7;
@@ -12,6 +13,7 @@ function global:prompt {
   $cwd = '';
   if ($PWD.Provider.Name -eq 'FileSystem') { $cwd = $e + ']7717;cwd;' + $PWD.ProviderPath + $b };
   $text = & $global:__bebo_prompt;
+  if ($text -eq ('PS ' + $PWD.Path + '> ')) { $text = $e + '[90mPS ' + $e + '[36m' + $PWD.Path + '>' + $e + '[0m ' };
   $e + ']133;D;' + $code + $b + $cwd + $e + ']133;A' + $b + $text + $e + ']133;B' + $b
 };
 function global:restart { [Console]::Write($global:__bebo_e + ']7717;restart' + $global:__bebo_b) };
@@ -21,5 +23,18 @@ if (Get-Module PSReadLine) {
     $line = [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine($Host.Runspace, $ExecutionContext);
     if ($line.Trim()) { [Console]::Write($global:__bebo_e + ']133;C' + $global:__bebo_b) };
     $line
-  }
+  };
+  try { Set-PSReadLineKeyHandler -Chord 'Ctrl+F12' -ScriptBlock {
+    $line = $null;
+    $cursor = $null;
+    [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor);
+    if (-not $line.Contains([string][char]10)) { [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt($null, [Console]::CursorTop) }
+  } } catch { };
+  $e = $global:__bebo_e;
+  try { Set-PSReadLineOption -Colors @{ Command = $e + '[34m'; Parameter = $e + '[33m'; Operator = $e + '[39m'; String = $e + '[32m'; Number = $e + '[33m'; Variable = $e + '[31m'; Keyword = $e + '[35m'; Member = $e + '[36m'; Type = $e + '[36m'; Comment = $e + '[90m'; Default = $e + '[39m' } } catch { }
+};
+if ($env:BEBO_BANNER) {
+  $parts = $env:BEBO_BANNER.Split('|');
+  [Console]::WriteLine($global:__bebo_e + '[' + $parts[0] + 'm' + $parts[1] + $global:__bebo_e + '[0m');
+  $env:BEBO_BANNER = $null
 };

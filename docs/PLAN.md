@@ -267,3 +267,213 @@ To reach 100 ms, replace `wgpu` with direct Direct3D 11 calls. This is a large c
 | `BEBO_TEST=tdef` | Runs commands at start: `t` tab, `d` split right, `e` split down, `f` search. |
 | `BEBO_BACKEND=dx12` | Uses DirectX 12. |
 | `BEBO_GPU=low` | Uses the integrated GPU (DirectX 12 only). |
+
+## 9. Design build (2026-11-16)
+
+This section is the status of the build from the reference designs. Where it and an earlier section are different, this section is correct.
+
+### Source files
+
+| File | Job |
+|---|---|
+| `main.rs` | App state, commands, input, tabs, panes, restart, find, colon popup logic. |
+| `ui.rs` | All drawing: title bar, panes, minimap, palette, popups, badges. |
+| `render.rs` | GPU renderer: rounded rectangles, text in three fonts, two text layers. |
+| `theme.rs` | One Dark and One Light colors. |
+| `pty.rs` | Shell profiles, ConPTY, shell marks, new environment. |
+| `shell/bebo.ps1` | PowerShell integration: marks, prompt colors, command colors, restart banner. |
+
+### Done and tested in the window
+
+| Design item | Result |
+|---|---|
+| Custom title bar: logo, `bebo / shell title`, window buttons | Works |
+| Tabs in the title bar with two or more tabs, shell badge, close button, `+`, profile menu | Works |
+| One Dark and One Light themes | Works |
+| Colon popup at an empty prompt (`:t` lists `:tab` and `:theme`) | Works |
+| `:restart` arguments `restore`, `force`, `clean` | Works |
+| Restart divider line and badge (`content restored`, `content lost · opened in home`) | Works |
+| Command palette with fuzzy filter and colored matches | Works |
+| Find bar: count, all matches colored, current match brighter, minimap marks | Works |
+| Prompt position top and bottom (`:layout`) | Works |
+| Split panes: accent line on the focused pane, other panes dimmer | Works |
+| Minimap lane: view position, failed commands (red), find matches (yellow) | Works |
+| Hint strip at an empty prompt, accent bar at the current prompt | Works |
+| Theme and prompt position stay after a restart of bebo (`%APPDATA%\bebo\state.txt`) | Works |
+| Unit tests (`cargo test`) | 8 pass |
+
+### Done but not tested by a real key press or mouse
+
+- All key chords: `Ctrl+Shift+P` palette, `Ctrl+Shift+T`, `Alt+Shift+-`, `Alt+Shift+=`, `Ctrl+Shift+1` to `4`, `Ctrl+Shift+R`.
+- Window drag by the title bar, double-click to maximize, resize by the window edges, the three window buttons.
+- The restart confirm box when a command runs.
+- Find toggles (`Aa`, `ab`, `.*`), Enter and Shift+Enter in find, a click in the minimap.
+- Arrow keys and Tab in the colon popup and the palette. Rename tab.
+- Command Prompt and WSL profiles.
+
+### Not built from the designs
+
+| Design item | Note |
+|---|---|
+| Settings page | Built. See section 10. |
+| Color output (paths, tables, JSON in command output) | Not built. The script sets the prompt colors and the PSReadLine command colors only. |
+| Warning marks in the minimap | Not built. The minimap has no data for warnings. Red marks come from the exit code. |
+| Minimap wide mode on hover, with the line label | Not built. |
+| Restart sweep line and dim of old text | Not built. A restart takes less than 150 ms. |
+| Blue dot on a tab with new output | Not built. |
+| Popup shadows | Not built. Popups have a border. |
+| App icon | Skipped, as agreed. |
+| Inter font | bebo uses Segoe UI for the interface. The Inter file on this PC is 13 MB, which makes the start slow. |
+
+### Differences from the designs
+
+- With one tab, the title bar has no `+` button. Use `Ctrl+Shift+T`, `:tab`, or the palette.
+- `:profile` opens the palette with the shell list. A profile opens in a new tab.
+- In the top layout, a restart with restore puts the old content in the scrollback. Scroll up to see it. In the bottom layout, the old content stays visible above the divider.
+- The snap layout menu of Windows 11 does not show on the maximize button. `Win+Arrow` keys work.
+
+### Known limits
+
+- A colon typed before the prompt is ready goes to the shell.
+- The exit code of a failed PowerShell command can be the code of an earlier program.
+- The minimap marks use the scrollback position. In the bottom layout with a short history, they are not next to their lines.
+- Find shows 2000 matches maximum.
+
+### Measured speed (release build)
+
+| Measure | Result |
+|---|---|
+| Window visible | 110 ms |
+| First GPU frame | 260 ms |
+| Shell prompt ready | 440 ms |
+| RAM, one tab | 71 MB |
+| Idle CPU | 0 % |
+| Binary size | 7.9 MB |
+
+### Test aids
+
+`BEBO_TEST` runs commands at start: `t` tab, `d` split right, `e` split down, `f` find, `p` palette, `m` profile menu, `l` light theme, `b` bottom layout.
+
+## 10. Settings page (2026-11-16)
+
+Open it with `Ctrl+,`, `:settings`, the palette, or the profile menu. Esc closes it.
+bebo writes each change immediately to `%APPDATA%\bebo\settings.txt`. The file has `key=value` lines and you can edit it.
+The old file `state.txt` is not read.
+
+| Page | Setting | Values |
+|---|---|---|
+| Appearance | Theme | One Dark, One Light, System (the app mode of Windows, read at start) |
+| Appearance | Prompt position | Top, Bottom |
+| Appearance | Command popup | Auto, Always below, Always above |
+| Appearance | Font | A click selects the next installed font: JetBrains Mono NL, Cascadia Mono, Consolas |
+| Appearance | Font size | 10 to 24 px |
+| Appearance | Cursor | Beam, Block, Underline |
+| Appearance | Tab bar | Auto, Always, Never |
+| Appearance | Minimap | On, Off |
+| Appearance | Clickable paths | On, Off |
+| Appearance | Command strip | On, Off |
+| Startup | Default shell | The installed shells. It applies at the next start. |
+| Keys | Key list | Read only |
+
+The Appearance page has a preview of the theme, the font, and the cursor.
+
+### Tested in the window
+
+- The page draws in One Dark and One Light.
+- Clicks on Theme, Cursor, Font size, and Minimap changed the page, the preview, and the file.
+- A new start applied the theme, the cursor, the font size, and the minimap setting.
+- Unit tests: 9 pass. One test reads and writes the settings text.
+
+### Not tested
+
+- `Ctrl+,` and Esc.
+- Prompt position, Command popup, Font, Tab bar, Clickable paths, Command strip, and Default shell controls.
+- The Keys page.
+
+### Differences from the design
+
+- The pages Profiles, Terminal, and Command strip are not built. Command strip is a switch on the Appearance page.
+- Font is not a list. A click selects the next font.
+- Minimap has On and Off only, because the wide mode is not built.
+- Color output and Reduce motion have no switch, because those features are not built.
+- The keys cannot be changed.
+
+### Test aids
+
+- `BEBO_CONFIG` selects a different folder for `settings.txt`.
+- `BEBO_TEST=s` opens the settings page at start.
+
+## 11. Fixes and features (2026-11-17)
+
+The settings file has a new key `animations`. The key `strip` is not used now.
+Section 10 is not fully correct now: the settings are a tab, Font is a list, and Command strip is removed.
+
+### Faults that are fixed
+
+| Fault | Cause | Fix |
+|---|---|---|
+| The cursor and the colored cells move away from the text after a zoom | bebo rounded the cell width to a full pixel. The text used the exact width. | The cell width is the exact advance of the font. |
+| Content is lost after the window becomes small and then large | At a grow, alacritty_terminal moves scrollback lines into the screen. ConPTY then draws its screen on top of them. | bebo moves the lines back to the scrollback. |
+| After a resize, the command text shows at a wrong row | PSReadLine calculates a wrong prompt row after a resize. | 150 ms after a resize, bebo sends Ctrl+F12. A key handler in `bebo.ps1` draws the prompt again at the cursor row. |
+| bebo stops when a minimized window opens again | A window size of zero went to the layout. | bebo ignores a size of zero. |
+| bebo stops if Windows reports a very large window size | wgpu refuses a surface above its size limit. | The size has a limit. |
+| The accent bar at the prompt flickers during typing | PSReadLine hides the cursor while it draws the line. The bar was a part of the cursor. | At the prompt, the cursor and the bar show always. |
+| The minimap is hard to use | The lane was 9 px wide and the resize edge used 5 px of it. | The lane is 14 px. The thumb is brighter, and brighter again below the mouse. |
+| A path has no mark below the mouse | Not built before. | A path or a link below the mouse gets an underline. With Ctrl, the mouse pointer is a hand. |
+| The settings page is small in a large window | The row width was fixed. | The rows and the preview use the window width, to a maximum of 1100 px, in the middle. |
+| Popup text mixes with the text behind it | All interface text was in one layer. | Popups have their own layer above all other parts. |
+
+### Features
+
+| Feature | How it works |
+|---|---|
+| Settings tab | `Ctrl+,` opens a tab with the settings. Esc or the close button closes it. |
+| Font list | The Font box opens a list of all installed font families. Fixed-width fonts are first. The mouse wheel moves the list. |
+| Animations | The caret moves smoothly along its row. Popups fade in and move down 8 px. Settings switches slide. The setting "Animations" stops all of this. |
+| Administrator | The shield button in the profile menu, or "Open ... as administrator" in the palette, starts a new bebo window as administrator. Windows asks first. The title bar of that window shows "Administrator". |
+| Icons | Lucide icons, from the font in the `lucide-icons` crate. bebo has no SVG renderer: the font has the same shapes. |
+| Interface font | Inter, from `Inter.ttc` in the font folder. If it is not installed, Segoe UI. |
+| Clear | `Ctrl+K` clears the output. A full-screen program (nano, vim) gets the key as before. |
+| New tab and menu buttons | They show also when there is one tab. |
+| Hint line | Removed. |
+
+### Large output speed
+
+Measured in bebo with 200,000 JSON lines (35 MB):
+
+| Command | Time |
+|---|---|
+| `cmd /c type`, before | 34.7 s |
+| `cmd /c type`, now | 27.5 s |
+| `cmd /c type` in a hidden classic console window, with no terminal program | 34.4 s |
+| `Get-Content` | 36.9 s |
+| `cat.exe` from Git for Windows | 3.1 s |
+
+- The slow part is the command that prints the file. `type` and `Get-Content` write the text slowly. bebo shows fast output at about 11 MB in a second.
+- For a large file, use a fast writer: `& 'C:\Program Files\Git\usr\bin\cat.exe' file`.
+- bebo now draws one frame for each 16 ms during output. Before, it drew about 110 frames in a second. This saves CPU.
+- Tried and removed: the newer ConPTY of Microsoft (`conpty.dll` and `OpenConsole.exe` 1.25, inside `bebo.exe`). The gain was 5 % to 13 % for the slow commands, and the `cat.exe` output stopped after about 470 lines.
+
+### Tested in the window
+
+- Text and find marks align at 13 px and 15 px, with JetBrains Mono NL and Maple Mono.
+- Shrink and grow: lines 40 to 60 stay in order, and the next commands show at the correct row.
+- Minimize and restore: bebo continues.
+- Minimap drag, link underline, settings tab at 1000 px and 1500 px, font list and font selection, palette above the settings tab, profile menu, `:clear`.
+- The shield button started an administrator window.
+- Unit tests: 10 pass.
+
+### Not tested
+
+- All key chords (`Ctrl+K`, `Ctrl+,`, Esc in the settings tab). The test tool cannot press them.
+- The animations in motion. A screenshot shows only the end position.
+- The "Administrator" label in the administrator window.
+- The mouse wheel in the font list.
+- The prompt redraw after a resize with PowerShell 7, and with a prompt of two or more lines.
+
+### Known limits
+
+- A font that is not fixed-width does not stay on the cell grid.
+- The prompt redraw after a resize is not done for a command of two or more lines.
+- While a full-screen program runs, a grow of the pane can remove lines of the main screen.
+- The font list has no search. Each row uses the interface font, not its own font.

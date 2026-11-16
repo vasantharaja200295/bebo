@@ -159,6 +159,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bebo"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "arboard",
+ "bytemuck",
+ "glyphon",
+ "lucide-icons",
+ "polling",
+ "pollster",
+ "wgpu",
+ "windows-sys 0.61.2",
+ "winit",
+ "winreg",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -999,6 +1016,12 @@ name = "lru"
 version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+
+[[package]]
+name = "lucide-icons"
+version = "1.73.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c54114e039d68d862d3831acca8a658f091ff6d5600dcb0208cf3c339104a14f"
 
 [[package]]
 name = "memchr"
@@ -2918,22 +2941,6 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "wisp"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "arboard",
- "bytemuck",
- "glyphon",
- "polling",
- "pollster",
- "wgpu",
- "windows-sys 0.61.2",
- "winit",
- "winreg",
 ]
 
 [[package]]

@@ -3,6 +3,8 @@
 
 mod pty;
 mod render;
+mod theme;
+mod ui;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -13,33 +15,26 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::{Event, WindowSize};
 use alacritty_terminal::event_loop::{EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::term::search::RegexSearch;
+use alacritty_terminal::term::search::{RegexIter, RegexSearch};
 use alacritty_terminal::term::{Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, CursorShape, Processor, StdSyncHandler};
+use alacritty_terminal::vte::ansi::{Color, Processor, StdSyncHandler};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::platform::windows::WindowAttributesExtWindows;
+use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
-use pty::{Mark, Proxy, SharedTerm, TermSize, UserEvent};
-use render::{Frame, Gpu, Quad, Row, Span};
+use pty::{Mark, Profile, Proxy, SharedTerm, TermSize, UserEvent};
+use render::Gpu;
+use theme::{Rgb, Theme};
 
-const BG: [u8; 3] = [0x14, 0x15, 0x1b];
-const FG: [u8; 3] = [0xd6, 0xd9, 0xe0];
-const CURSOR: [u8; 3] = [0xe6, 0xc0, 0x7b];
-const SELECTION: [u8; 3] = [0x33, 0x4a, 0x7a];
-const BAR: [u8; 3] = [0x0d, 0x0e, 0x12];
-const DIVIDER: [u8; 3] = [0x3a, 0x3d, 0x4a];
-const SEPARATOR: [u8; 3] = [0x26, 0x28, 0x33];
-const ERROR: [u8; 3] = [0xe0, 0x6c, 0x75];
-const PAD: f32 = 6.0;
-const FONT_PX: f32 = 15.0;
+const FONT_PX: f32 = 13.0;
 
 #[derive(Clone, Copy)]
 struct Rect {
@@ -60,6 +55,7 @@ struct Pane {
     tx: EventLoopSender,
     /// Changes at each restart. Exit events of an old shell have an old value.
     generation: u32,
+    profile: Profile,
     cols: usize,
     rows: usize,
     /// Cell where the command text starts: (line + history size, column).
@@ -70,15 +66,31 @@ struct Pane {
     title: String,
     /// One block for each prompt, in line order.
     blocks: Vec<Block>,
+    /// Grid line at the top row of the view. `draw` sets it.
+    view_top: i32,
+    /// Pixel position of the cursor cell. `draw` sets it.
+    cursor_px: Option<(f32, f32)>,
+    /// Message at the prompt after a restart.
+    badge: Option<Badge>,
+    /// After a resize, bebo asks PowerShell at this time to draw the prompt again.
+    prompt_fix: Option<Instant>,
 }
 
 /// A prompt, its command, and the output of the command.
 struct Block {
     /// Line of the prompt: grid line + history size.
     line: i32,
+    command: String,
     exec_at: Option<Instant>,
     exit: Option<i32>,
     duration: Option<Duration>,
+}
+
+struct Badge {
+    text: String,
+    lost: bool,
+    /// The badge goes away at this time. `None`: it stays until the first key.
+    until: Option<Instant>,
 }
 
 enum Node {
@@ -147,6 +159,10 @@ impl Node {
 struct Tab {
     root: Node,
     focus: usize,
+    /// Name from the rename command.
+    name: Option<String>,
+    /// This tab shows the settings page. It has no pane: `focus` is `usize::MAX`.
+    settings: bool,
 }
 
 struct Divider {
@@ -274,11 +290,322 @@ struct Press {
     reported: bool,
 }
 
+/// An action of bebo. The palette, the colon popup, and the keys run these.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Cmd {
+    NewTab,
+    RenameTab,
+    NextTab,
+    SplitDown,
+    SplitRight,
+    ClosePane,
+    Find,
+    Restart,
+    RestartForce,
+    RestartClean,
+    Clear,
+    Layout,
+    Theme(bool),
+    Palette,
+    Profile(Profile),
+    /// Opens a new bebo window as administrator.
+    Admin(Profile),
+    Copy,
+    Paste,
+    Settings,
+}
+
+struct Entry {
+    category: &'static str,
+    title: String,
+    keys: &'static str,
+    cmd: Cmd,
+    current: bool,
+}
+
+/// Colon commands: name, description, keys, action.
+const COLON: [(&str, &str, &str, Cmd); 12] = [
+    ("tab", "New tab", "Ctrl+Shift+T", Cmd::NewTab),
+    ("hsplit", "Split top and bottom", "Alt+Shift+-", Cmd::SplitDown),
+    ("vsplit", "Split left and right", "Alt+Shift++", Cmd::SplitRight),
+    ("find", "Find in output", "Ctrl+Shift+F", Cmd::Find),
+    ("restart", "Restart the shell", "Ctrl+Shift+R", Cmd::Restart),
+    ("clear", "Clear output", "Ctrl+K", Cmd::Clear),
+    ("layout", "Prompt at top or bottom", "", Cmd::Layout),
+    ("profile", "Open a different shell", "", Cmd::Palette),
+    ("theme", "One Dark or One Light", "", Cmd::Palette),
+    ("rename", "Rename this tab", "", Cmd::RenameTab),
+    ("palette", "All actions", "Ctrl+Shift+P", Cmd::Palette),
+    ("settings", "Open the settings", "Ctrl+,", Cmd::Settings),
+];
+
+const RESTART_ARGS: [(&str, &str); 3] = [
+    ("restore", "Default. Keep scrollback and folder."),
+    ("force", "Skip the confirm. Stop running jobs."),
+    ("clean", "Start fresh. Content is lost."),
+];
+
+/// Rows of the colon popup for the typed text: (name, description, keys).
+fn colon_items(text: &str) -> Vec<(String, &'static str, &'static str)> {
+    if text == "restart" || text.starts_with("restart ") {
+        let last = if text.ends_with(' ') || text == "restart" { "" } else { text.rsplit(' ').next().unwrap_or("") };
+        return RESTART_ARGS.iter().filter(|(n, _)| n.starts_with(last)).map(|(n, d)| (n.to_string(), *d, "")).collect();
+    }
+    COLON.iter().filter(|(n, ..)| n.starts_with(text)).map(|(n, d, k, _)| (format!(":{n}"), *d, *k)).collect()
+}
+
+/// Positions of the characters of `query` in `text`, in order. `None` if there is no match.
+fn fuzzy(text: &str, query: &str) -> Option<Vec<usize>> {
+    let mut positions = Vec::new();
+    let mut chars = text.char_indices().map(|(i, c)| (i, c.to_ascii_lowercase()));
+    for q in query.chars().filter(|c| !c.is_whitespace()).map(|c| c.to_ascii_lowercase()) {
+        positions.push(chars.find(|(_, c)| *c == q)?.0);
+    }
+    Some(positions)
+}
+
+#[derive(Default)]
+struct Palette {
+    query: String,
+    selected: usize,
+    /// The box asks for a new tab name.
+    rename: bool,
+}
+
+#[derive(Default)]
+struct Colon {
+    text: String,
+    selected: usize,
+}
+
+#[derive(Default)]
+struct Find {
+    query: String,
+    case: bool,
+    word: bool,
+    regex: bool,
+    /// Start and end cell of each match, from top to bottom.
+    matches: Vec<(Point, Point)>,
+    current: usize,
+}
+
+impl Find {
+    fn pattern(&self) -> String {
+        let mut base = self.query.clone();
+        if !self.regex {
+            base = base.chars().flat_map(|c| if r"\.+*?()|[]{}^$#&-~".contains(c) { vec!['\\', c] } else { vec![c] }).collect();
+        }
+        if self.word {
+            base = format!(r"(?-u:\b)(?:{base})(?-u:\b)");
+        }
+        if self.case { format!("(?-i:{base})") } else { format!("(?i:{base})") }
+    }
+}
+
+/// A part of the window that reacts to the mouse. `draw` makes the list.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Hit {
+    TitleDrag,
+    Tab(usize),
+    TabClose(usize),
+    NewTab,
+    Menu,
+    MenuItem(usize),
+    /// The administrator button of a profile in the menu.
+    MenuAdmin(usize),
+    /// A row of the font list.
+    Font(usize),
+    WinMin,
+    WinMax,
+    WinClose,
+    PaletteItem(usize),
+    ColonItem(usize),
+    FindToggle(u8),
+    FindPrev,
+    FindNext,
+    FindClose,
+    Minimap(usize),
+    /// A control of the settings page: (row, choice).
+    Setting(u8, u8),
+    SettingsPage(usize),
+    /// A popup. A click here does nothing and does not go to the terminal.
+    Block,
+}
+
+/// Number of rows in the font list of the settings page.
+const FONT_ROWS: usize = 10;
+
+// Keys of the animation values.
+const A_PALETTE: u32 = 1;
+const A_MENU: u32 = 2;
+const A_COLON: u32 = 3;
+const A_FIND: u32 = 4;
+const A_FONTS: u32 = 5;
+const A_CONFIRM: u32 = 6;
+/// Settings switch `n` uses `A_SWITCH + n`.
+const A_SWITCH: u32 = 50;
+/// Pane `n` uses `A_CARET + 2 * n` for the caret x position and the next key for the caret row.
+const A_CARET: u32 = 1000;
+
+/// Values that move to a target in a short time. `draw` sets `dt` for each frame.
+#[derive(Default)]
+struct Anim {
+    values: HashMap<u32, f32>,
+    /// Seconds from the last frame.
+    dt: f32,
+    /// The setting "Animations".
+    on: bool,
+    /// A value moved in this frame. `draw` then asks for the next frame.
+    active: bool,
+}
+
+impl Anim {
+    /// Moves the value of `key` in the direction of `target` and returns it. The first call returns `target`.
+    /// The value stops when it is nearer than `near` to the target.
+    fn to(&mut self, key: u32, target: f32, near: f32) -> f32 {
+        let value = self.values.entry(key).or_insert(target);
+        if !self.on || (target - *value).abs() < near {
+            *value = target;
+        } else {
+            // The value goes 63 % of the distance in 45 ms.
+            *value += (target - *value) * (1.0 - (-self.dt / 0.045).exp());
+            self.active = true;
+        }
+        *value
+    }
+
+    fn set(&mut self, key: u32, value: f32) {
+        self.values.insert(key, value);
+    }
+}
+
+/// Sizes in pixels for the current scale and font.
+#[derive(Clone, Copy)]
+struct Metrics {
+    s: f32,
+    cw: f32,
+    ch: f32,
+    pad: f32,
+    /// Width of the minimap lane.
+    lane: f32,
+    /// Height of the title bar.
+    bar: f32,
+}
+
+/// The values of the settings page. `App::theme` and `App::bottom` hold the theme in use and the prompt position.
+#[derive(Clone, PartialEq)]
+struct Settings {
+    /// 0: One Dark, 1: One Light, 2: the theme of Windows.
+    theme: u8,
+    /// Colon popup. 0: auto, 1: always below, 2: always above.
+    popup: u8,
+    /// Terminal font name. Empty: the first installed font.
+    font: String,
+    /// Font size in logical pixels.
+    font_px: f32,
+    /// 0: beam, 1: block, 2: underline.
+    cursor: u8,
+    /// 0: tabs show with two or more tabs, 1: always, 2: never.
+    tab_bar: u8,
+    minimap: bool,
+    /// Ctrl+Click opens a path or a link.
+    links: bool,
+    /// The caret and the popups move smoothly.
+    animations: bool,
+    /// Shell of the first tab. `None`: PowerShell.
+    profile: Option<Profile>,
+}
+
+const THEMES: [&str; 3] = ["dark", "light", "system"];
+const POPUPS: [&str; 3] = ["auto", "below", "above"];
+const CURSORS: [&str; 3] = ["beam", "block", "underline"];
+const TAB_BARS: [&str; 3] = ["auto", "always", "never"];
+
+impl Settings {
+    /// Reads `key=value` lines. A missing or wrong line keeps the default value.
+    fn parse(text: &str) -> (Settings, bool) {
+        let mut s = Settings {
+            theme: 0,
+            popup: 0,
+            font: String::new(),
+            font_px: FONT_PX,
+            cursor: 0,
+            tab_bar: 0,
+            minimap: true,
+            links: true,
+            animations: true,
+            profile: None,
+        };
+        let mut bottom = false;
+        let pick = |list: &[&str], value: &str, default: u8| list.iter().position(|v| *v == value).map_or(default, |i| i as u8);
+        for (key, value) in text.lines().filter_map(|line| line.split_once('=')) {
+            let value = value.trim();
+            match key.trim() {
+                "theme" => s.theme = pick(&THEMES, value, s.theme),
+                "position" => bottom = value == "bottom",
+                "popup" => s.popup = pick(&POPUPS, value, s.popup),
+                "font" => s.font = value.to_string(),
+                "font_size" => s.font_px = value.parse().unwrap_or(FONT_PX).clamp(10.0, 24.0),
+                "cursor" => s.cursor = pick(&CURSORS, value, s.cursor),
+                "tab_bar" => s.tab_bar = pick(&TAB_BARS, value, s.tab_bar),
+                "minimap" => s.minimap = value != "off",
+                "links" => s.links = value != "off",
+                "animations" => s.animations = value != "off",
+                "profile" => s.profile = Profile::ALL.into_iter().find(|p| format!("{p:?}") == value),
+                _ => {},
+            }
+        }
+        (s, bottom)
+    }
+
+    fn to_text(&self, bottom: bool) -> String {
+        let on = |v: bool| if v { "on" } else { "off" };
+        format!(
+            "theme={}\nposition={}\npopup={}\nfont={}\nfont_size={}\ncursor={}\ntab_bar={}\nminimap={}\nlinks={}\nanimations={}\nprofile={}\n",
+            THEMES[self.theme as usize],
+            if bottom { "bottom" } else { "top" },
+            POPUPS[self.popup as usize],
+            self.font,
+            self.font_px,
+            CURSORS[self.cursor as usize],
+            TAB_BARS[self.tab_bar as usize],
+            on(self.minimap),
+            on(self.links),
+            on(self.animations),
+            self.profile.map_or(String::new(), |p| format!("{p:?}")),
+        )
+    }
+
+    fn theme(&self) -> Theme {
+        match self.theme {
+            1 => theme::ONE_LIGHT,
+            2 if !system_dark() => theme::ONE_LIGHT,
+            _ => theme::ONE_DARK,
+        }
+    }
+}
+
+/// Folder of `settings.txt`: `%APPDATA%\bebo`, or the folder in `BEBO_CONFIG`.
+fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("BEBO_CONFIG").map(PathBuf::from).or_else(|| std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("bebo")))
+}
+
+/// `true` if Windows uses the dark mode for apps.
+fn system_dark() -> bool {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        .and_then(|key| key.get_value::<u32, _>("AppsUseLightTheme"))
+        .map_or(true, |light| light == 0)
+}
+
 struct App {
     proxy: EventLoopProxy<UserEvent>,
     start: Instant,
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
+    gpu_rx: std::sync::mpsc::Receiver<render::Device>,
     panes: HashMap<usize, Pane>,
     tabs: Vec<Tab>,
     active: usize,
@@ -289,15 +616,49 @@ struct App {
     mouse: (f32, f32),
     press: Option<Press>,
     drag_divider: Option<usize>,
+    drag_minimap: Option<usize>,
     last_click: (Instant, Point, u8),
-    search: Option<String>,
+    last_title_click: Instant,
     clipboard: Option<arboard::Clipboard>,
-    gpu_rx: std::sync::mpsc::Receiver<render::Device>,
+    profiles: Vec<Profile>,
+    theme: Theme,
+    /// Prompt position: the prompt stays at the bottom edge.
+    bottom: bool,
+    scale: f32,
+    palette: Option<Palette>,
+    colon: Option<Colon>,
+    find: Option<Find>,
+    menu: bool,
+    /// Restart needs a confirm: (pane, clean).
+    confirm: Option<(usize, bool)>,
+    hits: Vec<(Rect, Hit)>,
+    hover: Option<Hit>,
+    quit: bool,
+    settings: Settings,
+    /// Page number of the settings tab.
+    settings_page: usize,
+    /// The font list is open. The value is the first row in view.
+    font_menu: Option<f32>,
+    anim: Anim,
+    last_frame: Instant,
+    /// A shell has new output that is not on the screen.
+    dirty: bool,
+    /// The cell below the mouse: (pane, cell).
+    hover_cell: Option<(usize, Point)>,
+    /// The link below the mouse: (pane, grid line, first column, last column).
+    hover_link: Option<(usize, i32, usize, usize)>,
+    /// bebo runs as administrator.
+    admin: bool,
 }
 
 impl App {
     fn focus(&self) -> usize {
         self.tabs[self.active].focus
+    }
+
+    /// The active tab is the settings tab.
+    fn in_settings(&self) -> bool {
+        self.tabs[self.active].settings
     }
 
     fn redraw(&self) {
@@ -312,61 +673,104 @@ impl App {
         }
     }
 
+    fn metrics(&self) -> Metrics {
+        let s = self.scale;
+        let (cw, ch) = self.gpu.as_ref().map_or((8.0, 16.0), |g| (g.cell_w, g.cell_h));
+        let lane = if self.settings.minimap { (14.0 * s).round() } else { 0.0 };
+        Metrics { s, cw, ch, pad: (10.0 * s).round(), lane, bar: (30.0 * s).round() }
+    }
+
     fn window_size(pane_cols: usize, pane_rows: usize, gpu: Option<&Gpu>) -> WindowSize {
         WindowSize {
             num_cols: pane_cols as u16,
             num_lines: pane_rows as u16,
             cell_width: gpu.map_or(8, |g| g.cell_w as u16),
-            cell_height: gpu.map_or(18, |g| g.cell_h as u16),
+            cell_height: gpu.map_or(16, |g| g.cell_h as u16),
         }
     }
 
-    fn new_pane(&mut self, cwd: Option<PathBuf>) -> usize {
+    /// `size` is the expected size in cells. A correct first size prevents a redraw by the shell after the layout.
+    fn new_pane(&mut self, cwd: Option<PathBuf>, profile: Profile, size: (usize, usize)) -> usize {
         let id = self.next_id;
         self.next_id += 1;
-        let (cols, rows) = (100, 30);
+        let (cols, rows) = (size.0.max(2), size.1.max(1));
         let proxy = Proxy { id, generation: 0, proxy: self.proxy.clone() };
         let term = pty::new_term(proxy.clone(), cols, rows);
         let size = Self::window_size(cols, rows, self.gpu.as_ref());
-        let tx = pty::spawn_shell(term.clone(), proxy, size, cwd.clone()).expect("cannot start the shell");
+        let tx = pty::spawn_shell(term.clone(), proxy, size, cwd.clone(), profile, None).expect("cannot start the shell");
         let pane = Pane {
             term,
             tx,
             generation: 0,
+            profile,
             cols,
             rows,
             input_start: None,
             await_input: false,
             cwd,
-            title: "bebo".into(),
+            title: profile.name().into(),
             blocks: Vec::new(),
+            view_top: 0,
+            cursor_px: None,
+            badge: None,
+            prompt_fix: None,
         };
         self.panes.insert(id, pane);
         id
     }
 
-    fn focus_cwd(&self) -> Option<PathBuf> {
-        self.panes.get(&self.focus()).and_then(|p| p.cwd.clone())
+    fn focus_pane(&self) -> Option<&Pane> {
+        self.tabs.get(self.active).and_then(|t| self.panes.get(&t.focus))
     }
 
-    fn new_tab(&mut self) {
-        let cwd = if self.tabs.is_empty() { None } else { self.focus_cwd() };
-        let id = self.new_pane(cwd);
-        self.tabs.push(Tab { root: Node::Leaf(id), focus: id });
+    fn new_tab(&mut self, profile: Option<Profile>) {
+        let cwd = self.focus_pane().and_then(|p| p.cwd.clone());
+        let profile = profile.or(self.focus_pane().map(|p| p.profile)).unwrap_or_else(Profile::default_profile);
+        let size = self.focus_pane().map_or((100, 30), |p| (p.cols, p.rows));
+        let id = self.new_pane(cwd, profile, size);
+        self.tabs.push(Tab { root: Node::Leaf(id), focus: id, name: None, settings: false });
         self.active = self.tabs.len() - 1;
         self.relayout();
     }
 
+    /// Splits the focused pane. If the pane is already in a split of this direction, the command closes the pane.
     fn split(&mut self, side_by_side: bool) {
-        let focus = self.tabs[self.active].focus;
-        let id = self.new_pane(self.focus_cwd());
+        let focus = self.focus();
+        if parent_split(&self.tabs[self.active].root, focus) == Some(side_by_side) {
+            self.close_pane(focus);
+            return;
+        }
+        let (cwd, profile, cols, rows) = self.focus_pane().map(|p| (p.cwd.clone(), p.profile, p.cols, p.rows)).unwrap();
+        let size = if side_by_side { (cols / 2, rows) } else { (cols, rows / 2) };
+        let id = self.new_pane(cwd, profile, size);
         let tab = &mut self.tabs[self.active];
         tab.root.split(focus, id, side_by_side);
         tab.focus = id;
         self.relayout();
     }
 
-    fn close_pane(&mut self, id: usize, event_loop: &ActiveEventLoop) {
+    fn remove_tab(&mut self, index: usize) {
+        self.tabs.remove(index);
+        // The settings tab alone does not keep bebo open.
+        if self.tabs.iter().all(|t| t.settings) {
+            self.quit = true;
+            return;
+        }
+        if self.active >= index && self.active > 0 {
+            self.active -= 1;
+        }
+        self.relayout();
+    }
+
+    /// Closes a pane. The id `usize::MAX` closes the settings tab.
+    fn close_pane(&mut self, id: usize) {
+        if id == usize::MAX {
+            self.font_menu = None;
+            if let Some(index) = self.tabs.iter().position(|t| t.settings) {
+                self.remove_tab(index);
+            }
+            return;
+        }
         let Some(pane) = self.panes.remove(&id) else { return };
         let _ = pane.tx.send(Msg::Shutdown);
         let Some(index) = self.tabs.iter().position(|t| {
@@ -387,36 +791,73 @@ impl App {
                     tab.focus = leaves[0];
                 }
             },
-            None => {
-                self.tabs.remove(index);
-                if self.tabs.is_empty() {
-                    event_loop.exit();
-                    return;
-                }
-                if self.active >= index && self.active > 0 {
-                    self.active -= 1;
-                }
-            },
+            None => return self.remove_tab(index),
         }
         self.relayout();
     }
 
+    fn close_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else { return };
+        let mut leaves = Vec::new();
+        tab.root.leaves(&mut leaves);
+        for id in leaves {
+            self.close_pane(id);
+        }
+    }
+
+    /// Restarts now, or asks first if a command runs and `force` is off.
+    fn request_restart(&mut self, id: usize, clean: bool, force: bool) {
+        let running = self.panes.get(&id).and_then(|p| p.blocks.last()).is_some_and(|b| b.exec_at.is_some() && b.exit.is_none());
+        if running && !force {
+            self.confirm = Some((id, clean));
+            self.redraw();
+        } else {
+            self.restart(id, clean);
+        }
+    }
+
     /// Stops the shell of the pane and starts a new shell with a new environment.
-    fn restart(&mut self, id: usize) {
+    /// `clean` removes the scrollback and starts in the home folder.
+    fn restart(&mut self, id: usize, clean: bool) {
         let gpu = self.gpu.as_ref();
         let Some(pane) = self.panes.get_mut(&id) else { return };
         let _ = pane.tx.send(Msg::Shutdown);
         pane.generation += 1;
         pane.input_start = None;
         pane.await_input = false;
+        // The content is also lost if the folder does not exist now.
+        let lost = clean || !pane.cwd.as_ref().is_some_and(|p| p.is_dir());
+        if lost {
+            pane.cwd = std::env::var_os("USERPROFILE").map(PathBuf::from);
+            pane.blocks.clear();
+        }
+        let line = "\u{2500}".repeat(6);
+        let state = if lost { "content lost" } else { "content restored" };
+        let banner = format!("{line} Session restarted \u{b7} {} \u{b7} {state} {line}", clock());
+        let color = if lost { "33" } else { "90" };
+        let powershell = matches!(pane.profile, Profile::Pwsh | Profile::PowerShell);
         {
             let mut term = pane.term.lock();
             let mut parser: Processor<StdSyncHandler> = Processor::new();
-            parser.advance(&mut *term, b"\x1b[?1049l\x1b[0m\x1b[?25h\r\n\x1b[2m[restarted]\x1b[0m\r\n");
+            // Leave the alternate screen and show the cursor. For a clean start, remove the scrollback also.
+            let mut reset = String::from("\x1b[?1049l\x1b[0m\x1b[?25h");
+            reset += if lost { "\x1b[H\x1b[2J\x1b[3J" } else { "\r\n" };
+            if !powershell {
+                reset += &format!("\x1b[{color}m{banner}\x1b[0m\r\n");
+            }
+            parser.advance(&mut *term, reset.as_bytes());
+            term.selection = None;
+            term.scroll_display(Scroll::Bottom);
         }
+        pane.badge = Some(Badge {
+            text: if lost { "content lost \u{b7} opened in home".into() } else { "content restored".into() },
+            lost,
+            until: (!lost).then(|| Instant::now() + Duration::from_secs(3)),
+        });
         let proxy = Proxy { id, generation: pane.generation, proxy: self.proxy.clone() };
         let size = Self::window_size(pane.cols, pane.rows, gpu);
-        match pty::spawn_shell(pane.term.clone(), proxy, size, pane.cwd.clone()) {
+        let banner = powershell.then(|| format!("{color}|{banner}"));
+        match pty::spawn_shell(pane.term.clone(), proxy, size, pane.cwd.clone(), pane.profile, banner) {
             Ok(tx) => pane.tx = tx,
             Err(err) => {
                 let mut term = pane.term.lock();
@@ -434,22 +875,30 @@ impl App {
             return;
         }
         let Ok(parts) = self.gpu_rx.try_recv() else { return };
-        let font_px = FONT_PX * window.scale_factor() as f32;
-        self.gpu = Some(Gpu::new(window, parts, font_px, self.start));
+        self.scale = window.scale_factor() as f32;
+        let mut gpu = Gpu::new(window, parts, self.settings.font_px * self.scale, self.start);
+        gpu.set_mono(&self.settings.font);
+        self.gpu = Some(gpu);
         render::tick(self.start, "gpu ready");
         self.relayout();
         self.draw();
 
-        // Test aid: BEBO_TEST=tde runs these commands at start (t: tab, d: split right, e: split down, f: search).
+        // Test aid: BEBO_TEST runs these commands at start.
+        // t: tab, d: split right, e: split down, f: find, p: palette, m: profile menu, l: light theme, b: bottom layout.
         for command in std::env::var("BEBO_TEST").unwrap_or_default().chars() {
             match command {
-                't' => self.new_tab(),
+                't' => self.new_tab(None),
                 'd' => self.split(true),
                 'e' => self.split(false),
                 'f' => {
-                    self.search = Some("bebo".into());
-                    self.relayout();
+                    self.find = Some(Find { query: "bebo".into(), ..Default::default() });
+                    self.find_update();
                 },
+                'p' => self.palette = Some(Palette::default()),
+                'm' => self.menu = true,
+                'l' => self.theme = theme::ONE_LIGHT,
+                's' => self.run(Cmd::Settings),
+                'b' => self.bottom = true,
                 _ => {},
             }
         }
@@ -461,106 +910,72 @@ impl App {
         }
     }
 
-    fn bar_heights(&self) -> (f32, f32) {
-        let cell_h = self.gpu.as_ref().map_or(18.0, |g| g.cell_h);
-        let tab_bar = if self.tabs.len() > 1 { cell_h + 10.0 } else { 0.0 };
-        let search_bar = if self.search.is_some() { cell_h + 8.0 } else { 0.0 };
-        (tab_bar, search_bar)
-    }
-
     /// Calculates the pane rectangles and sends a new size to each shell that needs it.
     fn relayout(&mut self) {
+        let m = self.metrics();
         let Some(gpu) = self.gpu.as_ref() else { return };
         let (width, height) = gpu.size();
-        let (tab_bar, search_bar) = self.bar_heights();
-        let area = Rect { x: 0.0, y: tab_bar, w: width, h: (height - tab_bar - search_bar).max(1.0) };
+        let area = Rect { x: 0.0, y: m.bar, w: width, h: (height - m.bar).max(1.0) };
         self.pane_rects.clear();
         self.dividers.clear();
         layout(&self.tabs[self.active].root, area, &mut Vec::new(), &mut self.pane_rects, &mut self.dividers);
         for (id, rect) in &self.pane_rects {
             let Some(pane) = self.panes.get_mut(id) else { continue };
-            let cols = (((rect.w - 2.0 * PAD) / gpu.cell_w) as usize).max(2);
-            let rows = (((rect.h - 2.0 * PAD) / gpu.cell_h) as usize).max(1);
+            let cols = (((rect.w - m.pad * 1.5 - m.lane) / m.cw) as usize).max(2);
+            let rows = (((rect.h - m.pad) / m.ch) as usize).max(1);
             if (cols, rows) != (pane.cols, pane.rows) {
                 pane.cols = cols;
                 pane.rows = rows;
                 // A new width moves the lines, so the block lines are not correct after a resize.
                 pane.blocks.clear();
-                pane.term.lock().resize(TermSize { cols, rows });
+                let mut term = pane.term.lock();
+                let old_rows = term.screen_lines();
+                let history = term.grid().history_size();
+                let full_screen = term.mode().contains(TermMode::ALT_SCREEN);
+                term.resize(TermSize { cols, rows });
+                // When the pane grows, alacritty_terminal moves scrollback lines down into the screen.
+                // ConPTY does not: it keeps the top line and draws its screen again, on top of those lines.
+                // Move the lines back to the scrollback, or the shell output erases them.
+                // ponytail: not done while a full-screen program runs, because the main grid is not accessible then.
+                let pulled = rows.saturating_sub(old_rows).min(history);
+                if pulled > 0 && !full_screen {
+                    let grid = term.grid_mut();
+                    grid.scroll_up(&(Line(0)..Line(rows as i32)), pulled);
+                    grid.cursor.point.line.0 -= pulled as i32;
+                }
+                drop(term);
                 let _ = pane.tx.send(Msg::Resize(Self::window_size(cols, rows, Some(gpu))));
+                // Wait until the resize stops. A window drag gives many sizes.
+                pane.prompt_fix = Some(Instant::now() + Duration::from_millis(150));
             }
         }
-        if let (Some(window), Some(pane)) = (&self.window, self.panes.get(&self.focus())) {
-            window.set_title(&pane.title);
+        if let (Some(window), Some(pane)) = (&self.window, self.focus_pane()) {
+            window.set_title(&format!("bebo \u{2013} {}", self.tab_title(self.active, pane)));
         }
         self.redraw();
     }
 
-    fn draw(&mut self) {
-        let Some(gpu) = self.gpu.as_mut() else { return };
-        let (width, height) = gpu.size();
-        let (cw, ch) = (gpu.cell_w, gpu.cell_h);
-        let mut frame = Frame::default();
-        let text = |x: f32, y: f32, clip: Rect, s: &str, color: [u8; 3]| Row {
-            x,
-            y,
-            clip: [clip.x, clip.y, clip.x + clip.w, clip.y + clip.h],
-            spans: vec![Span { text: s.to_string(), color, bold: false, italic: false }],
-        };
-
-        // Tab bar. It shows only with two or more tabs.
-        if self.tabs.len() > 1 {
-            let bar_h = ch + 10.0;
-            frame.quads.push(Quad { x: 0.0, y: 0.0, w: width, h: bar_h, color: rgba(BAR) });
-            let tab_w = (width / self.tabs.len() as f32).min(260.0);
-            for (i, tab) in self.tabs.iter().enumerate() {
-                let rect = Rect { x: i as f32 * tab_w, y: 0.0, w: tab_w - 1.0, h: bar_h };
-                let active = i == self.active;
-                if active {
-                    frame.quads.push(Quad { x: rect.x, y: 0.0, w: rect.w, h: bar_h, color: rgba(BG) });
-                    frame.quads.push(Quad { x: rect.x, y: 0.0, w: rect.w, h: 2.0, color: rgba(CURSOR) });
-                }
-                let title = self.panes.get(&tab.focus).map_or("", |p| p.title.as_str());
-                let max = ((tab_w - 16.0) / cw) as usize;
-                let title: String = title.chars().rev().take(max).collect::<Vec<_>>().into_iter().rev().collect();
-                let color = if active { FG } else { dim(FG) };
-                frame.rows.push(text(rect.x + 8.0, 5.0, rect, &title, color));
-            }
-        }
-
-        let focus = self.tabs[self.active].focus;
-        for (id, rect) in &self.pane_rects {
-            if let Some(pane) = self.panes.get(id) {
-                draw_pane(&mut frame, pane, *rect, *id == focus, cw, ch);
-            }
-        }
-        for d in &self.dividers {
-            frame.overlay.push(Quad { x: d.rect.x, y: d.rect.y, w: d.rect.w, h: d.rect.h, color: rgba(DIVIDER) });
-        }
-
-        if let Some(pattern) = &self.search {
-            let bar = Rect { x: 0.0, y: height - ch - 8.0, w: width, h: ch + 8.0 };
-            frame.quads.push(Quad { x: bar.x, y: bar.y, w: bar.w, h: bar.h, color: rgba(BAR) });
-            let label = format!("search (regex): {pattern}_   Enter: older   Shift+Enter: newer   Esc: close");
-            frame.rows.push(text(8.0, bar.y + 4.0, bar, &label, FG));
-        }
-
-        gpu.render(&frame, BG);
+    fn tab_title(&self, index: usize, pane: &Pane) -> String {
+        self.tabs[index].name.clone().unwrap_or_else(|| pane.title.clone())
     }
 
     fn pane_at(&self, x: f32, y: f32) -> Option<(usize, Rect)> {
         self.pane_rects.iter().copied().find(|(_, r)| r.contains(x, y))
     }
 
+    fn pane_rect(&self, id: usize) -> Option<Rect> {
+        self.pane_rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r)
+    }
+
     fn cell_at(&self, id: usize, rect: Rect, x: f32, y: f32) -> Option<(Point, Side)> {
-        let gpu = self.gpu.as_ref()?;
+        let m = self.metrics();
         let pane = self.panes.get(&id)?;
-        let col = ((x - rect.x - PAD) / gpu.cell_w).max(0.0);
+        let col = ((x - rect.x - m.pad) / m.cw).max(0.0);
         let side = if col.fract() < 0.5 { Side::Left } else { Side::Right };
         let col = (col as usize).min(pane.cols - 1);
-        let row = (((y - rect.y - PAD) / gpu.cell_h).max(0.0) as usize).min(pane.rows - 1);
-        let offset = pane.term.lock().grid().display_offset() as i32;
-        Some((Point::new(Line(row as i32 - offset), Column(col)), side))
+        let row = (((y - rect.y - m.pad * 0.6) / m.ch).max(0.0) as usize).min(pane.rows - 1);
+        let first = -(pane.term.lock().grid().history_size() as i32);
+        Some((Point::new(Line((pane.view_top + row as i32).max(first)), Column(col)), side))
     }
 
     fn mouse_report(&self, id: usize, button: u8, point: Point, pressed: bool) {
@@ -569,7 +984,7 @@ impl App {
         let sgr = pane.term.lock().mode().contains(TermMode::SGR_MOUSE);
         let bytes = if sgr {
             format!("\x1b[<{button};{col};{row}{}", if pressed { 'M' } else { 'm' }).into_bytes()
-        } else if col < 223 && row < 223 {
+        } else if col < 223 && (1..223).contains(&row) {
             let button = if pressed { button } else { 3 };
             vec![0x1b, b'[', b'M', 32 + button, 32 + col as u8, 32 + row as u8]
         } else {
@@ -578,16 +993,57 @@ impl App {
         self.send(id, bytes);
     }
 
+    /// Direction of a window resize if the mouse is on the window edge.
+    fn resize_edge(&self) -> Option<ResizeDirection> {
+        let window = self.window.as_ref()?;
+        if window.is_maximized() {
+            return None;
+        }
+        let size = window.inner_size();
+        let (x, y) = self.mouse;
+        let e = 5.0 * self.scale;
+        let (left, right) = (x < e, x > size.width as f32 - e);
+        let (top, bottom) = (y < e, y > size.height as f32 - e);
+        Some(match (left, right, top, bottom) {
+            (true, _, true, _) => ResizeDirection::NorthWest,
+            (_, true, true, _) => ResizeDirection::NorthEast,
+            (true, _, _, true) => ResizeDirection::SouthWest,
+            (_, true, _, true) => ResizeDirection::SouthEast,
+            (true, ..) => ResizeDirection::West,
+            (_, true, ..) => ResizeDirection::East,
+            (_, _, true, _) => ResizeDirection::North,
+            (_, _, _, true) => ResizeDirection::South,
+            _ => return None,
+        })
+    }
+
+    fn hit_at(&self, x: f32, y: f32) -> Option<Hit> {
+        self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h)
+    }
+
     fn mouse_press(&mut self) {
         let (x, y) = self.mouse;
-        let (tab_bar, _) = self.bar_heights();
-        if y < tab_bar {
-            let tab_w = (self.gpu.as_ref().map_or(1.0, |g| g.size().0) / self.tabs.len() as f32).min(260.0);
-            let index = (x / tab_w) as usize;
-            if index < self.tabs.len() {
-                self.active = index;
-                self.relayout();
-            }
+        if let (Some(direction), Some(window)) = (self.resize_edge(), &self.window) {
+            let _ = window.drag_resize_window(direction);
+            return;
+        }
+        let hit = self.hit_at(x, y);
+        // A click outside a popup closes the popup.
+        if self.menu && !matches!(hit, Some(Hit::MenuItem(_) | Hit::Menu)) {
+            self.menu = false;
+            self.redraw();
+        }
+        if self.font_menu.is_some() && !matches!(hit, Some(Hit::Font(_) | Hit::Setting(3, _))) {
+            self.font_menu = None;
+            self.redraw();
+        }
+        if self.palette.is_some() && !matches!(hit, Some(Hit::PaletteItem(_) | Hit::Block)) {
+            self.palette = None;
+            self.redraw();
+            return;
+        }
+        if let Some(hit) = hit {
+            self.click(hit);
             return;
         }
         if let Some(i) = self.divider_at(x, y) {
@@ -597,7 +1053,7 @@ impl App {
         let Some((id, rect)) = self.pane_at(x, y) else { return };
         self.tabs[self.active].focus = id;
         let Some((point, side)) = self.cell_at(id, rect, x, y) else { return };
-        if self.mods.control_key() && self.open_link(id, point) {
+        if self.mods.control_key() && self.settings.links && self.open_link(id, point) {
             return;
         }
 
@@ -623,6 +1079,108 @@ impl App {
         self.relayout();
     }
 
+    fn click(&mut self, hit: Hit) {
+        let window = self.window.clone();
+        match hit {
+            Hit::TitleDrag => {
+                let now = Instant::now();
+                let double = now - self.last_title_click < Duration::from_millis(400);
+                self.last_title_click = now;
+                if let Some(window) = window {
+                    if double {
+                        window.set_maximized(!window.is_maximized());
+                    } else {
+                        let _ = window.drag_window();
+                    }
+                }
+            },
+            Hit::Tab(i) => {
+                self.active = i;
+                self.relayout();
+            },
+            Hit::TabClose(i) => self.close_tab(i),
+            Hit::NewTab => self.new_tab(None),
+            Hit::Menu => {
+                self.menu = !self.menu;
+                self.redraw();
+            },
+            Hit::MenuItem(i) => {
+                self.menu = false;
+                if let Some(profile) = self.profiles.get(i).copied() {
+                    self.new_tab(Some(profile));
+                } else {
+                    self.run(Cmd::Settings);
+                }
+            },
+            Hit::MenuAdmin(i) => {
+                self.menu = false;
+                if let Some(profile) = self.profiles.get(i).copied() {
+                    self.open_admin(profile);
+                }
+                self.redraw();
+            },
+            Hit::Font(i) => self.set_font_family(i),
+            Hit::WinMin => {
+                if let Some(window) = window {
+                    window.set_minimized(true);
+                }
+            },
+            Hit::WinMax => {
+                if let Some(window) = window {
+                    window.set_maximized(!window.is_maximized());
+                }
+            },
+            Hit::WinClose => self.quit = true,
+            Hit::PaletteItem(i) => self.palette_run(i),
+            Hit::ColonItem(i) => {
+                if let Some(colon) = &mut self.colon {
+                    colon.selected = i;
+                }
+                self.colon_run();
+            },
+            Hit::FindToggle(i) => {
+                if let Some(find) = &mut self.find {
+                    match i {
+                        0 => find.case = !find.case,
+                        1 => find.word = !find.word,
+                        _ => find.regex = !find.regex,
+                    }
+                }
+                self.find_update();
+            },
+            Hit::FindPrev => self.find_step(true),
+            Hit::FindNext => self.find_step(false),
+            Hit::FindClose => {
+                self.find = None;
+                self.redraw();
+            },
+            Hit::Minimap(id) => {
+                self.drag_minimap = Some(id);
+                self.minimap_scroll(id);
+            },
+            Hit::Setting(id, value) => self.set_setting(id, value),
+            Hit::SettingsPage(page) => {
+                self.settings_page = page;
+                self.font_menu = None;
+                self.redraw();
+            },
+            Hit::Block => {},
+        }
+    }
+
+    /// Scrolls the pane so that the mouse position in the minimap is in the middle of the view.
+    fn minimap_scroll(&mut self, id: usize) {
+        let (Some(rect), Some(pane)) = (self.pane_rect(id), self.panes.get(&id)) else { return };
+        let mut term = pane.term.lock();
+        let history = term.grid().history_size() as i32;
+        let total = (history + pane.rows as i32) as f32;
+        let ratio = ((self.mouse.1 - rect.y) / rect.h).clamp(0.0, 1.0);
+        let target = (ratio * total) as i32 - history - pane.rows as i32 / 2;
+        term.scroll_display(Scroll::Delta(pane.view_top - target));
+        drop(term);
+        self.redraw();
+    }
+
     fn mouse_move(&mut self) {
         let (x, y) = self.mouse;
         if let Some(i) = self.drag_divider {
@@ -635,18 +1193,47 @@ impl App {
             self.relayout();
             return;
         }
+        if let Some(id) = self.drag_minimap {
+            self.minimap_scroll(id);
+            return;
+        }
+        let hover = self.hit_at(x, y);
+        if hover != self.hover {
+            self.hover = hover;
+            self.redraw();
+        }
+        // A path or a link below the mouse gets an underline.
+        let cell = if hover.is_none() && self.settings.links && self.press.is_none() {
+            self.pane_at(x, y).and_then(|(id, rect)| self.cell_at(id, rect, x, y).map(|(point, _)| (id, point)))
+        } else {
+            None
+        };
+        if cell != self.hover_cell {
+            self.hover_cell = cell;
+            // ponytail: each new cell asks the disk if the path exists. Add a cache if a network folder makes this slow.
+            let link = cell.and_then(|(id, point)| self.link_at(id, point).map(|(_, first, last)| (id, point.line.0, first, last)));
+            if link != self.hover_link {
+                self.hover_link = link;
+                self.redraw();
+            }
+        }
         if let Some(window) = &self.window {
-            let icon = match self.divider_at(x, y) {
-                Some(i) if self.dividers[i].side_by_side => CursorIcon::ColResize,
-                Some(_) => CursorIcon::RowResize,
-                None if y < self.bar_heights().0 => CursorIcon::Default,
-                None => CursorIcon::Text,
+            let icon = match (self.resize_edge(), hover, self.divider_at(x, y)) {
+                (Some(ResizeDirection::East | ResizeDirection::West), ..) => CursorIcon::EwResize,
+                (Some(ResizeDirection::North | ResizeDirection::South), ..) => CursorIcon::NsResize,
+                (Some(ResizeDirection::NorthWest | ResizeDirection::SouthEast), ..) => CursorIcon::NwseResize,
+                (Some(_), ..) => CursorIcon::NeswResize,
+                (None, Some(_), _) => CursorIcon::Default,
+                (None, None, Some(i)) if self.dividers[i].side_by_side => CursorIcon::ColResize,
+                (None, None, Some(_)) => CursorIcon::RowResize,
+                (None, None, None) if self.hover_link.is_some() && self.mods.control_key() => CursorIcon::Pointer,
+                (None, None, None) => CursorIcon::Text,
             };
             window.set_cursor(icon);
         }
         let Some(press) = &self.press else { return };
-        let (id, start, start_side, clicks, reported) = (press.pane, press.point, press.side, press.clicks, press.reported);
-        let Some(rect) = self.pane_rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r) else { return };
+        let (id, start, start_side, reported) = (press.pane, press.point, press.side, press.reported);
+        let Some(rect) = self.pane_rect(id) else { return };
         let Some((point, side)) = self.cell_at(id, rect, x, y) else { return };
         if reported {
             let drag = self.panes[&id].term.lock().mode().intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION);
@@ -668,7 +1255,6 @@ impl App {
             },
         }
         drop(term);
-        let _ = clicks;
         if let Some(press) = &mut self.press {
             press.moved = true;
         }
@@ -677,11 +1263,11 @@ impl App {
 
     fn mouse_release(&mut self) {
         self.drag_divider = None;
+        self.drag_minimap = None;
         let Some(press) = self.press.take() else { return };
         if press.reported {
             let (x, y) = self.mouse;
-            let rect = self.pane_rects.iter().find(|(p, _)| *p == press.pane).map(|(_, r)| *r);
-            let point = rect.and_then(|r| self.cell_at(press.pane, r, x, y)).map_or(press.point, |(p, _)| p);
+            let point = self.pane_rect(press.pane).and_then(|r| self.cell_at(press.pane, r, x, y)).map_or(press.point, |(p, _)| p);
             self.mouse_report(press.pane, 0, point, false);
             return;
         }
@@ -713,6 +1299,15 @@ impl App {
     }
 
     fn wheel(&mut self, lines: i32) {
+        if self.in_settings() {
+            // The wheel moves the font list.
+            let count = self.gpu.as_mut().map_or(0, |gpu| gpu.families().len());
+            if let Some(scroll) = &mut self.font_menu {
+                *scroll = (*scroll - lines as f32).clamp(0.0, count.saturating_sub(FONT_ROWS) as f32);
+                self.redraw();
+            }
+            return;
+        }
         let (x, y) = self.mouse;
         let Some((id, rect)) = self.pane_at(x, y) else { return };
         let Some(pane) = self.panes.get(&id) else { return };
@@ -733,7 +1328,7 @@ impl App {
     }
 
     fn copy(&mut self) {
-        let Some(text) = self.panes.get(&self.focus()).and_then(|p| p.term.lock().selection_to_string()) else { return };
+        let Some(text) = self.focus_pane().and_then(|p| p.term.lock().selection_to_string()) else { return };
         self.set_clipboard(text);
     }
 
@@ -770,60 +1365,81 @@ impl App {
         self.redraw();
     }
 
-    /// Finds a match of the search pattern and selects it.
-    /// `advance` starts at the current match. If not, the search starts at the end of the output.
-    fn find(&mut self, older: bool, advance: bool) {
-        let Some(pattern) = self.search.clone() else { return };
-        let Some(pane) = self.panes.get(&self.focus()) else { return };
-        let mut term = pane.term.lock();
-        let current = term.selection.as_ref().and_then(|s| s.to_range(&term));
-        term.selection = None;
-        if pattern.is_empty() {
+    /// Finds all matches of the find text. The last match becomes the current match.
+    fn find_update(&mut self) {
+        let bottom = self.bottom;
+        let (Some(find), Some(pane)) = (self.find.as_mut(), self.tabs.get(self.active).and_then(|t| self.panes.get(&t.focus)))
+        else {
             return;
-        }
-        let Ok(mut regex) = RegexSearch::new(&pattern) else { return };
-        let direction = if older { Direction::Left } else { Direction::Right };
-        let origin = match (advance, current) {
-            (true, Some(range)) if older => range.start.sub(&*term, Boundary::None, 1),
-            (true, Some(range)) => range.end.add(&*term, Boundary::None, 1),
-            _ => Point::new(term.bottommost_line(), term.last_column()),
         };
-        let side = if older { Side::Right } else { Side::Left };
-        if let Some(found) = term.search_next(&mut regex, origin, direction, side, None) {
-            let mut selection = Selection::new(SelectionType::Simple, *found.start(), Side::Left);
-            selection.update(*found.end(), Side::Right);
-            term.selection = Some(selection);
-            term.scroll_to_point(*found.start());
+        find.matches.clear();
+        find.current = 0;
+        if !find.query.is_empty() {
+            let term = pane.term.lock();
+            if let Ok(mut regex) = RegexSearch::new(&find.pattern()) {
+                let start = Point::new(term.topmost_line(), Column(0));
+                let end = Point::new(term.bottommost_line(), term.last_column());
+                // ponytail: 2000 matches maximum. Add paging if a log needs more.
+                let iter = RegexIter::new(start, end, Direction::Right, &term, &mut regex);
+                find.matches = iter.take(2000).map(|m| (*m.start(), *m.end())).collect();
+                find.current = find.matches.len().saturating_sub(1);
+            }
+            drop(term);
+            Self::find_show(find, pane, bottom);
         }
+        self.redraw();
+    }
+
+    /// Scrolls the current match into the view.
+    fn find_show(find: &Find, pane: &Pane, bottom: bool) {
+        let Some((start, _)) = find.matches.get(find.current) else { return };
+        let mut term = pane.term.lock();
+        let top = view_top(&term, pane.rows, bottom);
+        if !(top..top + pane.rows as i32).contains(&start.line.0) {
+            term.scroll_display(Scroll::Delta(top - (start.line.0 - pane.rows as i32 / 2)));
+        }
+    }
+
+    fn find_step(&mut self, older: bool) {
+        let bottom = self.bottom;
+        let (Some(find), Some(pane)) = (self.find.as_mut(), self.tabs.get(self.active).and_then(|t| self.panes.get(&t.focus)))
+        else {
+            return;
+        };
+        let n = find.matches.len();
+        if n > 0 {
+            find.current = if older { (find.current + n - 1) % n } else { (find.current + 1) % n };
+            Self::find_show(find, pane, bottom);
+        }
+        self.redraw();
     }
 
     /// Scrolls to the prompt above or below the top line of the view.
     fn jump_prompt(&mut self, up: bool) {
-        let Some(pane) = self.panes.get(&self.focus()) else { return };
+        let Some(pane) = self.focus_pane() else { return };
         let mut term = pane.term.lock();
         let history = term.grid().history_size() as i32;
-        let offset = term.grid().display_offset() as i32;
-        let top = -offset;
+        let top = pane.view_top;
         let lines = pane.blocks.iter().map(|b| b.line - history);
         let target = if up { lines.filter(|l| *l < top).max() } else { lines.filter(|l| *l > top).min() };
         match target {
-            Some(line) if line < 0 => term.scroll_display(Scroll::Delta(-line - offset)),
-            _ if !up => term.scroll_display(Scroll::Bottom),
-            _ => {},
+            Some(line) => term.scroll_display(Scroll::Delta(top - line)),
+            None if !up => term.scroll_display(Scroll::Bottom),
+            None => {},
         }
         drop(term);
         self.redraw();
     }
 
-    /// Opens the URL or the file path at `point`. Returns `false` if there is no link.
-    fn open_link(&self, id: usize, point: Point) -> bool {
-        let Some(pane) = self.panes.get(&id) else { return false };
+    /// The URL or the file path at `point`: the target to open, and the first and last column of its text.
+    fn link_at(&self, id: usize, point: Point) -> Option<(String, usize, usize)> {
+        let pane = self.panes.get(&id)?;
         let term = pane.term.lock();
         let grid = term.grid();
-        let text = match grid[point.line][point.column].hyperlink() {
-            Some(link) => link.uri().to_string(),
+        let (text, first, last) = match grid[point.line][point.column].hyperlink() {
+            Some(link) => (link.uri().to_string(), point.column.0, point.column.0),
             None => {
-                let mut chars = Vec::new();
+                let (mut chars, mut columns) = (Vec::new(), Vec::new());
                 let mut index = 0;
                 for col in 0..grid.columns() {
                     let cell = &grid[point.line][Column(col)];
@@ -834,12 +1450,19 @@ impl App {
                         index = chars.len();
                     }
                     chars.push(cell.c);
+                    columns.push(col);
                 }
-                token_at(&chars, index)
+                let (start, end) = token_range(&chars, index)?;
+                (chars[start..end].iter().collect(), columns[start], columns[end - 1])
             },
         };
         drop(term);
-        let Some(target) = resolve_link(&text, pane.cwd.as_deref()) else { return false };
+        resolve_link(&text, pane.cwd.as_deref()).map(|target| (target, first, last))
+    }
+
+    /// Opens the URL or the file path at `point`. Returns `false` if there is no link.
+    fn open_link(&self, id: usize, point: Point) -> bool {
+        let Some((target, ..)) = self.link_at(id, point) else { return false };
         // A program or a script does not start from a click. Explorer shows the file.
         let risky = ["exe", "bat", "cmd", "com", "ps1", "msi", "vbs", "js", "lnk", "scr"];
         let extension = std::path::Path::new(&target).extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
@@ -856,6 +1479,7 @@ impl App {
     fn set_font(&mut self, font_px: f32) {
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_font_px(font_px);
+            self.settings.font_px = (gpu.font_px / self.scale).round();
         }
         // Force a new size for each pane.
         for pane in self.panes.values_mut() {
@@ -864,70 +1488,382 @@ impl App {
         self.relayout();
     }
 
-    fn default_font_px(&self) -> f32 {
-        FONT_PX * self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32)
+    /// The list of the palette.
+    fn entries(&self) -> Vec<Entry> {
+        let entry = |category, title: &str, keys, cmd| Entry { category, title: title.to_string(), keys, cmd, current: false };
+        let mut list = vec![
+            entry("Tab", "New tab", "Ctrl+Shift+T", Cmd::NewTab),
+            entry("Tab", "Rename tab...", "", Cmd::RenameTab),
+            entry("Pane", "Split top and bottom", "Alt+Shift+-", Cmd::SplitDown),
+            entry("Pane", "Split left and right", "Alt+Shift++", Cmd::SplitRight),
+            entry("Find", "Find in output", "Ctrl+Shift+F", Cmd::Find),
+            entry("Session", "Restart shell \u{b7} restore content", "Ctrl+Shift+R", Cmd::Restart),
+            entry("Session", "Restart shell \u{b7} force", "", Cmd::RestartForce),
+            entry("Session", "Restart shell \u{b7} clean, content lost", "", Cmd::RestartClean),
+            entry("Session", "Clear output", "Ctrl+K", Cmd::Clear),
+            entry("Pane", "Close pane", "Ctrl+Shift+W", Cmd::ClosePane),
+            entry("Tab", "Next tab", "Ctrl+Tab", Cmd::NextTab),
+            entry("Edit", "Copy", "Ctrl+Shift+C", Cmd::Copy),
+            entry("Edit", "Paste", "Ctrl+Shift+V", Cmd::Paste),
+            entry("View", "Settings", "Ctrl+,", Cmd::Settings),
+        ];
+        for dark in [true, false] {
+            let name = if dark { "Theme \u{b7} One Dark" } else { "Theme \u{b7} One Light" };
+            list.push(Entry { current: self.theme.dark == dark, ..entry("View", name, "", Cmd::Theme(dark)) });
+        }
+        let position = if self.bottom { "Prompt position \u{b7} top" } else { "Prompt position \u{b7} bottom" };
+        list.push(entry("View", position, "", Cmd::Layout));
+        for profile in &self.profiles {
+            list.push(entry("Profile", &format!("Open {}", profile.name()), "", Cmd::Profile(*profile)));
+        }
+        for profile in &self.profiles {
+            list.push(entry("Admin", &format!("Open {} as administrator", profile.name()), "", Cmd::Admin(*profile)));
+        }
+        list
     }
 
-    fn key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
+    /// The palette rows that match the typed text, with the positions of the matched characters.
+    fn palette_rows(&self) -> Vec<(Entry, Vec<usize>)> {
+        let query = self.palette.as_ref().map_or("", |p| p.query.as_str());
+        let mut rows: Vec<(Entry, Vec<usize>)> =
+            self.entries().into_iter().filter_map(|e| fuzzy(&e.title, query).map(|positions| (e, positions))).collect();
+        // The best match has its characters near the start and near each other.
+        rows.sort_by_key(|(_, p)| p.first().map_or(0, |first| first * 4 + (p.last().unwrap() - first)));
+        rows
+    }
+
+    fn palette_run(&mut self, index: usize) {
+        let Some(palette) = self.palette.take() else { return };
+        if palette.rename {
+            let name = palette.query.trim();
+            self.tabs[self.active].name = (!name.is_empty()).then(|| name.to_string());
+            self.relayout();
+            return;
+        }
+        self.palette = Some(palette);
+        let cmd = self.palette_rows().get(index).map(|(e, _)| e.cmd);
+        self.palette = None;
+        match cmd {
+            Some(cmd) => self.run(cmd),
+            None => self.redraw(),
+        }
+    }
+
+    fn run(&mut self, cmd: Cmd) {
+        let focus = self.focus();
+        // The settings tab has no pane. Only the commands for tabs and for the window apply there.
+        let general = matches!(
+            cmd,
+            Cmd::NewTab | Cmd::NextTab | Cmd::ClosePane | Cmd::Layout | Cmd::Theme(_) | Cmd::Palette | Cmd::Profile(_) | Cmd::Admin(_) | Cmd::Settings
+        );
+        if self.in_settings() && !general {
+            return;
+        }
+        match cmd {
+            Cmd::NewTab => self.new_tab(None),
+            Cmd::RenameTab => self.palette = Some(Palette { rename: true, ..Default::default() }),
+            Cmd::NextTab => {
+                self.active = (self.active + 1) % self.tabs.len();
+                self.relayout();
+            },
+            Cmd::SplitDown => self.split(false),
+            Cmd::SplitRight => self.split(true),
+            Cmd::ClosePane => self.close_pane(focus),
+            Cmd::Find => {
+                if self.find.is_none() {
+                    self.find = Some(Find::default());
+                }
+            },
+            Cmd::Restart => self.request_restart(focus, false, false),
+            Cmd::RestartForce => self.request_restart(focus, false, true),
+            Cmd::RestartClean => self.request_restart(focus, true, false),
+            Cmd::Clear => {
+                if let Some(pane) = self.panes.get_mut(&focus) {
+                    let mut parser: Processor<StdSyncHandler> = Processor::new();
+                    parser.advance(&mut *pane.term.lock(), b"\x1b[H\x1b[2J\x1b[3J");
+                    pane.blocks.clear();
+                    // Ctrl+L makes the shell draw the prompt again.
+                    let _ = pane.tx.send(Msg::Input(Cow::Borrowed(b"\x0c")));
+                }
+            },
+            Cmd::Layout => {
+                self.bottom = !self.bottom;
+                self.save_state();
+            },
+            Cmd::Theme(dark) => {
+                self.settings.theme = if dark { 0 } else { 1 };
+                self.theme = self.settings.theme();
+                self.save_state();
+            },
+            Cmd::Palette => self.palette = Some(Palette::default()),
+            Cmd::Profile(profile) => self.new_tab(Some(profile)),
+            Cmd::Admin(profile) => self.open_admin(profile),
+            Cmd::Copy => self.copy(),
+            Cmd::Paste => self.paste(),
+            Cmd::Settings => {
+                match self.tabs.iter().position(|t| t.settings) {
+                    Some(index) => self.active = index,
+                    None => {
+                        self.tabs.push(Tab { root: Node::Leaf(usize::MAX), focus: usize::MAX, name: None, settings: true });
+                        self.active = self.tabs.len() - 1;
+                    },
+                }
+                self.relayout();
+            },
+        }
+        self.redraw();
+    }
+
+    /// Runs the selected row of the colon popup.
+    fn colon_run(&mut self) {
+        let Some(colon) = self.colon.take() else { return };
+        let focus = self.focus();
+        let items = colon_items(&colon.text);
+        let selected = items.get(colon.selected).map(|(name, ..)| name.trim_start_matches(':').to_string());
+        if colon.text == "restart" || colon.text.starts_with("restart ") {
+            let mut words: Vec<&str> = colon.text.split_whitespace().skip(1).collect();
+            // A part of a word selects the row of the popup.
+            if let (Some(last), Some(selected)) = (words.last_mut(), selected.as_deref())
+                && !RESTART_ARGS.iter().any(|(n, _)| n == last)
+            {
+                *last = selected;
+            }
+            self.request_restart(focus, words.contains(&"clean"), words.contains(&"force"));
+            return;
+        }
+        match selected.as_deref() {
+            Some("theme") => self.palette = Some(Palette { query: "theme".into(), ..Default::default() }),
+            Some("profile") => self.palette = Some(Palette { query: "open".into(), ..Default::default() }),
+            Some(name) => {
+                if let Some((.., cmd)) = COLON.iter().find(|(n, ..)| *n == name) {
+                    self.run(*cmd);
+                }
+            },
+            // No such command: the shell gets the text.
+            None => self.send(focus, format!(":{}\r", colon.text).into_bytes()),
+        }
+        self.redraw();
+    }
+
+    /// Keys for the colon popup. Returns `true` if the popup used the key.
+    fn colon_key(&mut self, key: &Key, text: Option<&str>) -> bool {
+        let focus = self.focus();
+        let plain = !self.mods.control_key() && !self.mods.alt_key();
+        let Some(colon) = self.colon.as_mut() else {
+            // A colon at the start of an empty command line opens the popup.
+            let empty = self.focus_pane().is_some_and(|pane| {
+                Region::new(pane, &pane.term.lock()).is_some_and(|r| r.cursor == 0 && r.end == 0)
+            });
+            if plain && text == Some(":") && empty {
+                self.colon = Some(Colon::default());
+                self.redraw();
+                return true;
+            }
+            return false;
+        };
+        let count = colon_items(&colon.text).len().max(1);
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                // Esc closes the popup and keeps the text on the command line.
+                let text = format!(":{}", colon.text);
+                self.colon = None;
+                self.send(focus, text.into_bytes());
+            },
+            Key::Named(NamedKey::Enter) => self.colon_run(),
+            Key::Named(NamedKey::ArrowDown) => colon.selected = (colon.selected + 1) % count,
+            Key::Named(NamedKey::ArrowUp) => colon.selected = (colon.selected + count - 1) % count,
+            Key::Named(NamedKey::Tab) => {
+                if let Some((name, ..)) = colon_items(&colon.text).get(colon.selected) {
+                    let name = name.trim_start_matches(':');
+                    if colon.text.starts_with("restart") && name != "restart" {
+                        let keep = colon.text.rfind(' ').map_or("restart ".len().min(colon.text.len()), |i| i + 1);
+                        colon.text.truncate(keep);
+                        if !colon.text.ends_with(' ') {
+                            colon.text.push(' ');
+                        }
+                        colon.text += name;
+                    } else {
+                        colon.text = name.to_string();
+                    }
+                    colon.text.push(' ');
+                    colon.selected = 0;
+                }
+            },
+            Key::Named(NamedKey::Backspace) => {
+                if colon.text.pop().is_none() {
+                    self.colon = None;
+                }
+            },
+            Key::Named(NamedKey::Space) if colon.text.is_empty() => {
+                // A colon and a space go to the shell.
+                self.colon = None;
+                self.send(focus, b": ".to_vec());
+            },
+            _ => {
+                if let (Some(text), true) = (text, plain)
+                    && !text.chars().any(char::is_control)
+                {
+                    colon.text.push_str(text);
+                    colon.selected = 0;
+                }
+            },
+        }
+        self.redraw();
+        true
+    }
+
+    fn key(&mut self, event: KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
         }
         let (ctrl, shift, alt) = (self.mods.control_key(), self.mods.shift_key(), self.mods.alt_key());
         let key = event.logical_key.clone();
+        let text = event.text.as_deref().filter(|t| !t.chars().any(char::is_control));
+        let focus = self.focus();
 
-        if self.search.is_some() {
+        // The first key removes the restart message.
+        if let Some(pane) = self.panes.get_mut(&focus) {
+            pane.badge = None;
+        }
+
+        if let Some(palette) = self.palette.as_mut() {
+            let rename = palette.rename;
             match &key {
-                Key::Named(NamedKey::Escape) => {
-                    self.search = None;
-                    self.relayout();
+                Key::Named(NamedKey::Escape) => self.palette = None,
+                Key::Named(NamedKey::Enter) => {
+                    let selected = palette.selected;
+                    self.palette_run(selected);
                 },
-                Key::Named(NamedKey::Enter) => self.find(!shift, true),
+                Key::Named(NamedKey::ArrowDown) => palette.selected += 1,
+                Key::Named(NamedKey::ArrowUp) => palette.selected = palette.selected.saturating_sub(1),
                 Key::Named(NamedKey::Backspace) => {
-                    self.search.as_mut().unwrap().pop();
-                    self.find(true, false);
+                    palette.query.pop();
+                    palette.selected = 0;
                 },
                 _ => {
-                    if let (Some(text), false) = (&event.text, ctrl) {
-                        self.search.as_mut().unwrap().push_str(text);
-                        self.find(true, false);
+                    if let (Some(text), false) = (text, ctrl) {
+                        palette.query.push_str(text);
+                        palette.selected = 0;
                     }
                 },
             }
+            if !rename {
+                let count = self.palette_rows().len();
+                if let Some(palette) = self.palette.as_mut() {
+                    palette.selected = palette.selected.min(count.saturating_sub(1));
+                }
+            }
             self.redraw();
             return;
+        }
+
+        // The settings tab uses the mouse. Esc closes the font list, then the tab.
+        let in_settings = self.in_settings();
+        if in_settings && key == Key::Named(NamedKey::Escape) {
+            if self.font_menu.take().is_none() {
+                self.close_pane(usize::MAX);
+            }
+            self.redraw();
+            return;
+        }
+
+        if let Some((id, clean)) = self.confirm {
+            match &key {
+                Key::Named(NamedKey::Enter) => {
+                    self.confirm = None;
+                    self.restart(id, clean);
+                },
+                Key::Named(NamedKey::Escape) => self.confirm = None,
+                _ => {},
+            }
+            self.redraw();
+            return;
+        }
+
+        if self.menu {
+            self.menu = false;
+            self.redraw();
+            if key == Key::Named(NamedKey::Escape) {
+                return;
+            }
+        }
+
+        if !in_settings && let Some(find) = self.find.as_mut() {
+            let mut used = true;
+            match (&key, alt) {
+                (Key::Named(NamedKey::Escape), _) => {
+                    self.find = None;
+                    self.redraw();
+                },
+                // Enter goes to the older match, as in most terminals. Shift+Enter goes to the newer match.
+                (Key::Named(NamedKey::Enter), _) => self.find_step(!shift),
+                (Key::Named(NamedKey::Backspace), _) => {
+                    find.query.pop();
+                    self.find_update();
+                },
+                (Key::Character(c), true) if matches!(c.to_lowercase().as_str(), "c" | "w" | "r") => {
+                    match c.to_lowercase().as_str() {
+                        "c" => find.case = !find.case,
+                        "w" => find.word = !find.word,
+                        _ => find.regex = !find.regex,
+                    }
+                    self.find_update();
+                },
+                _ => match (text, ctrl || alt) {
+                    (Some(text), false) => {
+                        find.query.push_str(text);
+                        self.find_update();
+                    },
+                    _ => used = false,
+                },
+            }
+            if used {
+                return;
+            }
         }
 
         let character = match &key {
             Key::Character(c) => c.to_lowercase(),
             _ => String::new(),
         };
-        let focus = self.tabs[self.active].focus;
-        let has_selection =
-            self.panes.get(&focus).is_some_and(|p| p.term.lock().selection.as_ref().is_some_and(|s| !s.is_empty()));
+        let code = match event.physical_key {
+            PhysicalKey::Code(code) => Some(code),
+            _ => None,
+        };
+        let has_selection = self.focus_pane().is_some_and(|p| p.term.lock().selection.as_ref().is_some_and(|s| !s.is_empty()));
+        let font_px = self.gpu.as_ref().map_or(FONT_PX, |g| g.font_px);
+        // A full-screen program (nano, vim) gets Ctrl+K.
+        let full_screen = self.focus_pane().is_some_and(|p| p.term.lock().mode().contains(TermMode::ALT_SCREEN));
 
         // bebo commands.
-        let handled = match (ctrl, shift, alt, character.as_str(), &key) {
-            (true, true, false, "t", _) => self.new_tab(),
-            (true, true, false, "w", _) => self.close_pane(focus, event_loop),
-            (true, true, false, "d", _) => self.split(true),
-            (true, true, false, "e", _) => self.split(false),
-            (true, true, false, "r", _) => self.restart(focus),
-            (true, true, false, "f", _) => {
-                self.search = Some(String::new());
-                self.relayout();
-            },
+        match (ctrl, shift, alt, character.as_str(), &key) {
+            (true, true, false, "t", _) => self.run(Cmd::NewTab),
+            (true, true, false, "w", _) => self.run(Cmd::ClosePane),
+            (true, true, false, "r", _) => self.run(Cmd::Restart),
+            (true, true, false, "f", _) => self.run(Cmd::Find),
+            (true, true, false, "p", _) => self.run(Cmd::Palette),
             (true, true, false, "c", _) => self.copy(),
             (true, _, false, "v", _) => self.paste(),
+            (false, true, true, ..) if code == Some(KeyCode::Minus) => self.run(Cmd::SplitDown),
+            (false, true, true, ..) if code == Some(KeyCode::Equal) => self.run(Cmd::SplitRight),
+            (true, true, false, ..) if matches!(code, Some(KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4)) => {
+                let index = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4].iter().position(|c| Some(*c) == code);
+                if let Some(profile) = index.and_then(|i| self.profiles.get(i)).copied() {
+                    self.new_tab(Some(profile));
+                }
+            },
             (true, false, false, "c", _) if has_selection => {
                 self.copy();
-                if let Some(pane) = self.panes.get(&focus) {
+                if let Some(pane) = self.focus_pane() {
                     pane.term.lock().selection = None;
                 }
                 self.redraw();
             },
-            (true, false, false, "=" | "+", _) => self.set_font(self.gpu.as_ref().map_or(FONT_PX, |g| g.font_px + 1.0)),
-            (true, false, false, "-", _) => self.set_font(self.gpu.as_ref().map_or(FONT_PX, |g| g.font_px - 1.0)),
-            (true, false, false, "0", _) => self.set_font(self.default_font_px()),
+            (true, false, false, "=" | "+", _) => self.set_font(font_px + 1.0),
+            (true, false, false, "-", _) => self.set_font(font_px - 1.0),
+            (true, false, false, "0", _) => self.set_font(FONT_PX * self.scale),
+            (true, false, false, ",", _) => self.run(Cmd::Settings),
+            (true, false, false, "k", _) if !full_screen => self.run(Cmd::Clear),
             (true, _, false, _, Key::Named(NamedKey::Tab)) => {
                 let n = self.tabs.len();
                 self.active = if shift { (self.active + n - 1) % n } else { (self.active + 1) % n };
@@ -935,7 +1871,7 @@ impl App {
             },
             (false, true, false, _, Key::Named(NamedKey::PageUp | NamedKey::PageDown)) => {
                 let scroll = if key == Key::Named(NamedKey::PageUp) { Scroll::PageUp } else { Scroll::PageDown };
-                if let Some(pane) = self.panes.get(&focus) {
+                if let Some(pane) = self.focus_pane() {
                     pane.term.lock().scroll_display(scroll);
                 }
                 self.redraw();
@@ -953,12 +1889,13 @@ impl App {
                 self.tabs[self.active].focus = leaves[if back { (i + n - 1) % n } else { (i + 1) % n }];
                 self.relayout();
             },
+            _ if in_settings => {},
             _ => {
-                self.type_key(&key, event.text.as_deref());
-                return;
+                if !self.colon_key(&key, event.text.as_deref()) {
+                    self.type_key(&key, event.text.as_deref());
+                }
             },
-        };
-        let () = handled;
+        }
     }
 
     /// Sends a key to the shell. If a selection is in the command line, a text key replaces it.
@@ -972,10 +1909,12 @@ impl App {
         let plain = !ctrl && !alt;
         let is_text = plain && matches!(key, Key::Character(_) | Key::Named(NamedKey::Space));
         let is_delete = plain && matches!(key, Key::Named(NamedKey::Backspace | NamedKey::Delete));
-        let edit = if is_text || is_delete {
-            Region::new(pane, &term).and_then(|r| r.delete_selection(&term))
-        } else {
-            None
+        let region = Region::new(pane, &term);
+        let edit = if is_text || is_delete { region.as_ref().and_then(|r| r.delete_selection(&term)) } else { None };
+        // Keep the command text for the restart confirm.
+        let command = match (&region, key) {
+            (Some(r), Key::Named(NamedKey::Enter)) => Some(term.bounds_to_string(r.point(0), r.point((r.end - 1).max(0)))),
+            _ => None,
         };
         let out = match edit {
             Some(mut out) => {
@@ -991,12 +1930,21 @@ impl App {
         drop(term);
         if matches!(key, Key::Named(NamedKey::Enter)) {
             pane.input_start = None;
+            if let (Some(command), Some(block)) = (command, pane.blocks.last_mut()) {
+                block.command = command.trim().to_string();
+            }
         }
         let _ = pane.tx.send(Msg::Input(Cow::Owned(out)));
         self.redraw();
     }
 
-    fn term_event(&mut self, id: usize, generation: u32, event: Event, event_loop: &ActiveEventLoop) {
+    fn term_event(&mut self, id: usize, generation: u32, event: Event) {
+        // New output can move the text away from the link underline.
+        if matches!(event, Event::Wakeup) && self.hover_link.is_some_and(|link| link.0 == id) {
+            self.hover_link = None;
+            self.hover_cell = None;
+        }
+        let theme = self.theme;
         let gpu = self.gpu.as_ref();
         let Some(pane) = self.panes.get_mut(&id) else { return };
         match event {
@@ -1012,9 +1960,10 @@ impl App {
                     if pane.blocks.len() >= 2000 {
                         pane.blocks.remove(0);
                     }
-                    pane.blocks.push(Block { line, exec_at: None, exit: None, duration: None });
+                    pane.blocks.push(Block { line, command: String::new(), exec_at: None, exit: None, duration: None });
                 }
-                self.redraw();
+                // `about_to_wait` draws the output, with a limit on the number of frames in a second.
+                self.dirty = true;
             },
             Event::Title(title) => {
                 pane.title = title;
@@ -1025,7 +1974,7 @@ impl App {
             Event::PtyWrite(text) => self.send(id, text.into_bytes()),
             Event::ColorRequest(index, format) => {
                 let color = pane.term.lock().colors()[index];
-                let [r, g, b] = color.map_or(palette(index), |c| [c.r, c.g, c.b]);
+                let [r, g, b] = color.map_or(theme.palette(index), |c| [c.r, c.g, c.b]);
                 let text = format(alacritty_terminal::vte::ansi::Rgb { r, g, b });
                 self.send(id, text.into_bytes());
             },
@@ -1034,7 +1983,7 @@ impl App {
                 self.send(id, text.into_bytes());
             },
             Event::ClipboardStore(_, text) => self.set_clipboard(text),
-            Event::ChildExit(_) | Event::Exit if generation == pane.generation => self.close_pane(id, event_loop),
+            Event::ChildExit(_) | Event::Exit if generation == pane.generation => self.close_pane(id),
             _ => {},
         }
     }
@@ -1070,8 +2019,89 @@ impl App {
                 pane.cwd = Some(path);
                 self.relayout();
             },
-            Mark::Restart => self.restart(id),
+            Mark::Restart => self.request_restart(id, false, false),
         }
+    }
+
+    /// Changes one setting from the settings page. `id` is the row and `value` is the choice.
+    fn set_setting(&mut self, id: u8, value: u8) {
+        match id {
+            0 => {
+                self.settings.theme = value.min(2);
+                self.theme = self.settings.theme();
+            },
+            1 => self.bottom = value == 1,
+            2 => self.settings.popup = value.min(2),
+            3 => {
+                // Opens or closes the font list. The list opens near the font in use.
+                self.font_menu = match (self.font_menu, self.gpu.as_mut()) {
+                    (None, Some(gpu)) => {
+                        let current = gpu.mono().to_string();
+                        let families = gpu.families();
+                        let index = families.iter().position(|(name, _)| *name == current).unwrap_or(0);
+                        Some(index.saturating_sub(3).min(families.len().saturating_sub(FONT_ROWS)) as f32)
+                    },
+                    _ => None,
+                };
+                self.redraw();
+                return;
+            },
+            4 => {
+                let px = (self.settings.font_px + if value == 1 { 1.0 } else { -1.0 }).clamp(10.0, 24.0);
+                self.set_font(px * self.scale);
+            },
+            5 => self.settings.cursor = value.min(2),
+            6 => self.settings.tab_bar = value.min(2),
+            7 => self.settings.minimap = !self.settings.minimap,
+            8 => self.settings.links = !self.settings.links,
+            9 => self.settings.animations = !self.settings.animations,
+            10 => self.settings.profile = self.profiles.get(value as usize).copied(),
+            _ => {},
+        }
+        self.apply_settings();
+    }
+
+    /// Selects row `index` of the font list as the terminal font.
+    fn set_font_family(&mut self, index: usize) {
+        self.font_menu = None;
+        if let Some(gpu) = self.gpu.as_mut()
+            && let Some((name, _)) = gpu.families().get(index).cloned()
+        {
+            gpu.set_mono(&name);
+            self.settings.font = name;
+        }
+        self.apply_settings();
+    }
+
+    fn apply_settings(&mut self) {
+        self.save_state();
+        // The font and the minimap change the number of columns.
+        for pane in self.panes.values_mut() {
+            pane.cols = 0;
+        }
+        self.relayout();
+    }
+
+    /// Starts a new bebo window as administrator with this shell. Windows asks the user first.
+    fn open_admin(&self, profile: Profile) {
+        use std::os::windows::ffi::OsStrExt;
+        let wide = |text: &std::ffi::OsStr| text.encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+        let Ok(exe) = std::env::current_exe() else { return };
+        // `\.` at the end keeps a last backslash of the folder away from the quote.
+        let folder = self.focus_pane().and_then(|p| p.cwd.as_ref()).map_or(String::new(), |d| format!(" --cwd \"{}\\.\"", d.display()));
+        let (verb, exe) = (wide("runas".as_ref()), wide(exe.as_os_str()));
+        let arguments = wide(format!("--profile {profile:?}{folder}").as_ref());
+        // SAFETY: each string ends with a zero and lives until the call returns.
+        unsafe {
+            windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), exe.as_ptr(), arguments.as_ptr(), std::ptr::null(), 1);
+        }
+    }
+
+    /// Writes the settings to a file. bebo reads the file at the next start.
+    fn save_state(&self) {
+        let Some(dir) = config_dir() else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("settings.txt"), self.settings.to_text(self.bottom));
     }
 }
 
@@ -1080,10 +2110,17 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        let attributes = Window::default_attributes().with_title("bebo").with_inner_size(LogicalSize::new(1000.0, 640.0));
+        // bebo draws its own title bar. The shadow keeps the border and the rounded corners of Windows 11.
+        let attributes = Window::default_attributes()
+            .with_title("bebo")
+            .with_inner_size(LogicalSize::new(1000.0, 610.0))
+            .with_decorations(false)
+            // A test window does not take the keyboard focus from the user.
+            .with_active(std::env::var_os("BEBO_TEST").is_none())
+            .with_undecorated_shadow(true);
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
         // The window shows immediately with the background color. The GPU frame comes when the device is ready.
-        paint_background(&window);
+        paint_background(&window, self.theme.bg);
         self.window = Some(window);
         render::tick(self.start, "window");
         self.start_gpu();
@@ -1091,32 +2128,49 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Term(id, generation, event) => self.term_event(id, generation, event, event_loop),
+            UserEvent::Term(id, generation, event) => self.term_event(id, generation, event),
             UserEvent::Mark(id, mark) => self.mark(id, mark),
             UserEvent::GpuReady => self.start_gpu(),
         }
+        if self.quit {
+            event_loop.exit();
+        }
     }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            // A minimized window has the size zero. Keep the layout, so that the shells keep their size.
+            WindowEvent::Resized(size) if size.width == 0 || size.height == 0 => {},
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(size.width, size.height);
                 }
                 self.relayout();
             },
-            WindowEvent::ScaleFactorChanged { .. } => self.set_font(self.default_font_px()),
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.scale = scale_factor as f32;
+                self.set_font(self.settings.font_px * self.scale);
+            },
             WindowEvent::RedrawRequested if self.gpu.is_none() => {
                 if let Some(window) = &self.window {
-                    paint_background(window);
+                    paint_background(window, self.theme.bg);
                 }
             },
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
-            WindowEvent::KeyboardInput { event, .. } => self.key(event, event_loop),
+            WindowEvent::KeyboardInput { event, .. } => self.key(event),
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse = (position.x as f32, position.y as f32);
                 self.mouse_move();
+            },
+            // The test tool posts mouse messages while the real mouse is in a different window. Ignore the event then.
+            WindowEvent::CursorLeft { .. } if std::env::var_os("BEBO_TEST").is_none() => {
+                self.mouse = (-1.0, -1.0);
+                self.hover = None;
+                self.hover_cell = None;
+                self.hover_link = None;
+                self.redraw();
             },
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => self.mouse_press(),
@@ -1125,7 +2179,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i32,
-                    MouseScrollDelta::PixelDelta(p) => (p.y as f32 / self.gpu.as_ref().map_or(18.0, |g| g.cell_h)) as i32,
+                    MouseScrollDelta::PixelDelta(p) => (p.y as f32 / self.metrics().ch) as i32,
                 };
                 if lines != 0 {
                     self.wheel(lines);
@@ -1134,143 +2188,104 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(_) => self.redraw(),
             _ => {},
         }
+        if self.quit {
+            event_loop.exit();
+        }
+    }
+
+    /// Wakes up when a restart message must go away, or when a prompt needs a redraw after a resize.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let mut next: Option<Instant> = None;
+        let mut changed = false;
+        for pane in self.panes.values_mut() {
+            match pane.prompt_fix {
+                Some(time) if time <= now => {
+                    pane.prompt_fix = None;
+                    // Ctrl+F12 runs the key handler of the bebo shell script. Only a PowerShell prompt gets the key.
+                    if pane.input_start.is_some() && matches!(pane.profile, Profile::Pwsh | Profile::PowerShell) {
+                        let _ = pane.tx.send(Msg::Input(Cow::Borrowed(b"[24;5~")));
+                    }
+                },
+                Some(time) => next = Some(next.map_or(time, |n| n.min(time))),
+                None => {},
+            }
+            match pane.badge.as_ref().and_then(|b| b.until) {
+                Some(until) if until <= now => {
+                    pane.badge = None;
+                    changed = true;
+                },
+                Some(until) => next = Some(next.map_or(until, |n| n.min(until))),
+                None => {},
+            }
+        }
+        if changed {
+            self.redraw();
+        }
+        // Fast output gives thousands of wake-ups in a second. One frame for each 16 ms is sufficient.
+        if self.dirty {
+            let due = self.last_frame + Duration::from_millis(16);
+            if due <= now {
+                self.dirty = false;
+                self.redraw();
+            } else {
+                next = Some(next.map_or(due, |n| n.min(due)));
+            }
+        }
+        event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 }
 
-fn draw_pane(frame: &mut Frame, pane: &Pane, rect: Rect, focused: bool, cw: f32, ch: f32) {
-    let term = pane.term.lock();
-    let content = term.renderable_content();
-    let offset = content.display_offset as i32;
-    let (ox, oy) = (rect.x + PAD, rect.y + PAD);
-    let clip = [rect.x, rect.y, rect.x + rect.w, rect.y + rect.h];
-    let cursor = content.cursor;
-    let cursor_visible = cursor.shape != CursorShape::Hidden && offset == 0;
-
-    let mut row = i32::MIN;
-    let mut spans: Vec<Span> = Vec::new();
-    let flush = |row: i32, spans: &mut Vec<Span>, frame: &mut Frame| {
-        while let Some(last) = spans.last_mut() {
-            let trimmed = last.text.trim_end_matches(' ').len();
-            last.text.truncate(trimmed);
-            if !last.text.is_empty() {
-                break;
+/// Grid line at the top row of the view.
+/// With the prompt at the bottom, blank rows below the cursor move out and scrollback lines come in at the top.
+fn view_top(term: &Term<Proxy>, rows: usize, bottom: bool) -> i32 {
+    let grid = term.grid();
+    let mut shift = 0;
+    if bottom && !term.mode().contains(TermMode::ALT_SCREEN) {
+        let cursor_line = grid.cursor.point.line.0;
+        let mut last = cursor_line;
+        'find: for line in (cursor_line + 1..rows as i32).rev() {
+            for col in 0..grid.columns() {
+                if grid[Line(line)][Column(col)].c != ' ' {
+                    last = line;
+                    break 'find;
+                }
             }
-            spans.pop();
         }
-        if !spans.is_empty() {
-            frame.rows.push(Row { x: ox, y: oy + row as f32 * ch, clip, spans: std::mem::take(spans) });
-        }
+        shift = rows as i32 - 1 - last;
+    }
+    // With a short history, the view starts above the first line. `draw_pane` leaves those rows empty.
+    -(grid.display_offset() as i32) - shift
+}
+
+/// Direction of the split that has the leaf `id` as a direct child.
+fn parent_split(node: &Node, id: usize) -> Option<bool> {
+    match node {
+        Node::Leaf(_) => None,
+        Node::Split { side_by_side, a, b, .. } => {
+            if matches!(**a, Node::Leaf(l) if l == id) || matches!(**b, Node::Leaf(l) if l == id) {
+                Some(*side_by_side)
+            } else {
+                parent_split(a, id).or_else(|| parent_split(b, id))
+            }
+        },
+    }
+}
+
+/// Local time as "07:51 AM".
+fn clock() -> String {
+    // SAFETY: SYSTEMTIME is plain data, and GetLocalTime fills all of it.
+    let time = unsafe {
+        let mut time = std::mem::zeroed();
+        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut time);
+        time
     };
-
-    for cell in content.display_iter {
-        let point = cell.point;
-        let line = point.line.0 + offset;
-        if line != row {
-            if row != i32::MIN {
-                flush(row, &mut spans, frame);
-            }
-            row = line;
-        }
-        let flags = cell.flags;
-        if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-            continue;
-        }
-        let mut fg = resolve(cell.fg, content.colors);
-        let mut bg = resolve(cell.bg, content.colors);
-        if flags.contains(Flags::INVERSE) {
-            std::mem::swap(&mut fg, &mut bg);
-        }
-        if flags.contains(Flags::DIM) {
-            fg = dim(fg);
-        }
-        if content.selection.is_some_and(|s| s.contains(point)) {
-            bg = SELECTION;
-        }
-        let (x, y) = (ox + point.column.0 as f32 * cw, oy + line as f32 * ch);
-        let w = if flags.contains(Flags::WIDE_CHAR) { cw * 2.0 } else { cw };
-        if cursor_visible && point == cursor.point {
-            match cursor.shape {
-                CursorShape::Block if focused => {
-                    bg = CURSOR;
-                    fg = BG;
-                },
-                CursorShape::Beam if focused => frame.overlay.push(Quad { x, y, w: 2.0, h: ch, color: rgba(CURSOR) }),
-                CursorShape::Underline if focused => {
-                    frame.overlay.push(Quad { x, y: y + ch - 2.0, w, h: 2.0, color: rgba(CURSOR) })
-                },
-                _ => {
-                    // No focus: draw the outline only.
-                    for (qx, qy, qw, qh) in [(x, y, w, 1.0), (x, y + ch - 1.0, w, 1.0), (x, y, 1.0, ch), (x + w - 1.0, y, 1.0, ch)] {
-                        frame.overlay.push(Quad { x: qx, y: qy, w: qw, h: qh, color: rgba(CURSOR) });
-                    }
-                },
-            }
-        }
-        if bg != BG {
-            // Extend the last rectangle if it has the same color and touches this cell.
-            match frame.quads.last_mut() {
-                Some(q) if q.y == y && q.color == rgba(bg) && (q.x + q.w - x).abs() < 0.5 => q.w += w,
-                _ => frame.quads.push(Quad { x, y, w, h: ch, color: rgba(bg) }),
-            }
-        }
-        if flags.intersects(Flags::ALL_UNDERLINES) {
-            frame.overlay.push(Quad { x, y: y + ch - 2.0, w, h: 1.0, color: rgba(fg) });
-        }
-        if flags.contains(Flags::STRIKEOUT) {
-            frame.overlay.push(Quad { x, y: y + ch / 2.0, w, h: 1.0, color: rgba(fg) });
-        }
-
-        let c = if flags.contains(Flags::HIDDEN) || cell.c == '\t' { ' ' } else { cell.c };
-        let (bold, italic) = (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC));
-        match spans.last_mut() {
-            Some(s) if s.color == fg && s.bold == bold && s.italic == italic => s.text.push(c),
-            _ => spans.push(Span { text: c.to_string(), color: fg, bold, italic }),
-        }
-        if let Some(extra) = cell.zerowidth() {
-            spans.last_mut().unwrap().text.extend(extra);
-        }
-    }
-    if row != i32::MIN {
-        flush(row, &mut spans, frame);
-    }
-
-    // Command blocks: a separator above each prompt, a red bar for a failed command, and the duration.
-    let history = term.grid().history_size() as i32;
-    // ponytail: when the scrollback is full, old lines drop and the block lines are wrong. Blocks are off then.
-    if history >= 10_000 || term.mode().contains(TermMode::ALT_SCREEN) {
-        return;
-    }
-    let rows = pane.rows as i32;
-    for (i, block) in pane.blocks.iter().enumerate() {
-        let top = block.line - history + offset;
-        let end = pane.blocks.get(i + 1).map_or(rows, |next| next.line - history + offset).min(rows);
-        if end <= 0 || top >= rows {
-            continue;
-        }
-        if top > 0 && i > 0 {
-            frame.quads.push(Quad { x: rect.x, y: oy + top as f32 * ch - 1.0, w: rect.w, h: 1.0, color: rgba(SEPARATOR) });
-        }
-        let first = top.max(0);
-        if block.exit.is_some_and(|code| code != 0) {
-            frame.overlay.push(Quad { x: rect.x + 1.0, y: oy + first as f32 * ch, w: 3.0, h: (end - first) as f32 * ch, color: rgba(ERROR) });
-        }
-        if let (Some(duration), true) = (block.duration, top >= 0)
-            && duration >= Duration::from_secs(1)
-        {
-            let secs = duration.as_secs();
-            let mut label = if secs < 60 { format!("{:.1}s", duration.as_secs_f32()) } else { format!("{}m{}s", secs / 60, secs % 60) };
-            if let Some(code) = block.exit.filter(|code| *code != 0) {
-                label = format!("exit {code}  {label}");
-            }
-            let x = rect.x + rect.w - PAD - label.chars().count() as f32 * cw;
-            let color = if block.exit == Some(0) { dim(FG) } else { ERROR };
-            frame.rows.push(Row { x, y: oy + top as f32 * ch, clip, spans: vec![Span { text: label, color, bold: false, italic: false }] });
-        }
-    }
+    let hour = if time.wHour % 12 == 0 { 12 } else { time.wHour % 12 };
+    format!("{hour:02}:{:02} {}", time.wMinute, if time.wHour < 12 { "AM" } else { "PM" })
 }
 
 /// Fills the window with the background color through GDI. bebo uses this before the GPU is ready.
-fn paint_background(window: &Window) {
+fn paint_background(window: &Window, color: Rgb) {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, GetDC, ReleaseDC};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1283,23 +2298,31 @@ fn paint_background(window: &Window) {
     // SAFETY: `hwnd` is the handle of a window that is alive. The DC and the brush are released here.
     unsafe {
         let dc = GetDC(hwnd);
-        let brush = CreateSolidBrush(BG[0] as u32 | (BG[1] as u32) << 8 | (BG[2] as u32) << 16);
+        let brush = CreateSolidBrush(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
         FillRect(dc, &rect, brush);
         DeleteObject(brush);
         ReleaseDC(hwnd, dc);
     }
 }
 
-/// The word at `index`. A space, a quote, or a bracket ends the word.
-fn token_at(chars: &[char], index: usize) -> String {
+/// Start and end of the word at `index`. A space, a quote, or a bracket ends the word.
+fn token_range(chars: &[char], index: usize) -> Option<(usize, usize)> {
     let stop = |c: char| c.is_whitespace() || "\"'<>()[]{}|".contains(c);
     if chars.get(index).is_none_or(|c| stop(*c)) {
-        return String::new();
+        return None;
     }
     let start = chars[..index].iter().rposition(|c| stop(*c)).map_or(0, |i| i + 1);
-    let end = chars[index..].iter().position(|c| stop(*c)).map_or(chars.len(), |i| index + i);
-    let token: String = chars[start..end].iter().collect();
-    token.trim_end_matches(['.', ',', ';', ':', '!', '?']).to_string()
+    let mut end = chars[index..].iter().position(|c| stop(*c)).map_or(chars.len(), |i| index + i);
+    // Punctuation at the end of a sentence is not a part of the word.
+    while end > start && ".,;:!?".contains(chars[end - 1]) {
+        end -= 1;
+    }
+    (end > start).then_some((start, end))
+}
+
+#[cfg(test)]
+fn token_at(chars: &[char], index: usize) -> String {
+    token_range(chars, index).map_or(String::new(), |(start, end)| chars[start..end].iter().collect())
 }
 
 /// Returns the target to open: an http(s) URL, or a path that exists. `file.rs:12:5` gives `file.rs`.
@@ -1322,55 +2345,13 @@ fn resolve_link(text: &str, cwd: Option<&std::path::Path>) -> Option<String> {
     path.exists().then(|| path.to_string_lossy().into_owned())
 }
 
-fn rgba(c: [u8; 3]) -> [u8; 4] {
-    [c[0], c[1], c[2], 255]
-}
-
-fn dim(c: [u8; 3]) -> [u8; 3] {
-    c.map(|v| (v as f32 * 0.66) as u8)
-}
-
-fn palette(index: usize) -> [u8; 3] {
-    const BASE: [[u8; 3]; 16] = [
-        [0x1d, 0x1f, 0x28],
-        [0xe0, 0x6c, 0x75],
-        [0x98, 0xc3, 0x79],
-        [0xe5, 0xc0, 0x7b],
-        [0x61, 0xaf, 0xef],
-        [0xc6, 0x78, 0xdd],
-        [0x56, 0xb6, 0xc2],
-        [0xab, 0xb2, 0xbf],
-        [0x5c, 0x63, 0x70],
-        [0xf0, 0x7f, 0x89],
-        [0xa9, 0xd8, 0x8a],
-        [0xf2, 0xd0, 0x8c],
-        [0x74, 0xbf, 0xff],
-        [0xd8, 0x8c, 0xee],
-        [0x66, 0xcc, 0xd8],
-        [0xff, 0xff, 0xff],
-    ];
-    match index {
-        0..=15 => BASE[index],
-        16..=231 => {
-            let i = index - 16;
-            let level = |n: usize| if n == 0 { 0 } else { (55 + 40 * n) as u8 };
-            [level(i / 36), level(i / 6 % 6), level(i % 6)]
-        },
-        232..=255 => [(8 + 10 * (index - 232)) as u8; 3],
-        257 | 268 => BG,
-        258 => CURSOR,
-        259..=266 => dim(BASE[index - 259]),
-        _ => FG,
-    }
-}
-
-fn resolve(color: Color, colors: &Colors) -> [u8; 3] {
+fn resolve(color: Color, colors: &Colors, theme: &Theme) -> Rgb {
     let index = match color {
         Color::Spec(rgb) => return [rgb.r, rgb.g, rgb.b],
         Color::Named(name) => name as usize,
         Color::Indexed(i) => i as usize,
     };
-    colors[index].map_or(palette(index), |c| [c.r, c.g, c.b])
+    colors[index].map_or(theme.palette(index), |c| [c.r, c.g, c.b])
 }
 
 /// Changes a key press into the bytes that a terminal sends.
@@ -1435,6 +2416,7 @@ fn encode_key(key: &Key, text: Option<&str>, mods: ModifiersState, app_cursor: b
 fn main() {
     let start = Instant::now();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
+    event_loop.set_control_flow(ControlFlow::Wait);
     // Start the GPU on a second thread now. It is the slowest step of the start.
     let (gpu_tx, gpu_rx) = std::sync::mpsc::channel();
     let gpu_proxy = event_loop.create_proxy();
@@ -1442,12 +2424,26 @@ fn main() {
         let _ = gpu_tx.send(render::init_device(start));
         let _ = gpu_proxy.send_event(UserEvent::GpuReady);
     });
-    event_loop.set_control_flow(ControlFlow::Wait);
+    let state = config_dir().and_then(|d| std::fs::read_to_string(d.join("settings.txt")).ok()).unwrap_or_default();
+    let (settings, bottom) = Settings::parse(&state);
+    let profiles = Profile::available();
+    // `--profile` and `--cwd` come from "Open as administrator".
+    let args: Vec<String> = std::env::args().collect();
+    let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
+    let first_profile = arg("--profile")
+        .and_then(|value| Profile::ALL.into_iter().find(|p| format!("{p:?}") == *value))
+        .or(settings.profile)
+        .filter(|p| profiles.contains(p));
+    if let Some(folder) = arg("--cwd") {
+        // The first shell starts in the folder of the process.
+        let _ = std::env::set_current_dir(PathBuf::from(folder).components().collect::<PathBuf>());
+    }
     let mut app = App {
         proxy: event_loop.create_proxy(),
         start,
         window: None,
         gpu: None,
+        gpu_rx,
         panes: HashMap::new(),
         tabs: Vec::new(),
         active: 0,
@@ -1455,17 +2451,39 @@ fn main() {
         pane_rects: Vec::new(),
         dividers: Vec::new(),
         mods: ModifiersState::empty(),
-        mouse: (0.0, 0.0),
+        mouse: (-1.0, -1.0),
         press: None,
         drag_divider: None,
+        drag_minimap: None,
         last_click: (start, Point::new(Line(0), Column(0)), 0),
-        search: None,
+        last_title_click: start,
         clipboard: None,
-        gpu_rx,
+        profiles,
+        theme: settings.theme(),
+        bottom,
+        scale: 1.0,
+        palette: None,
+        colon: None,
+        find: None,
+        menu: false,
+        confirm: None,
+        hits: Vec::new(),
+        hover: None,
+        quit: false,
+        settings,
+        settings_page: 0,
+        font_menu: None,
+        anim: Anim::default(),
+        last_frame: start,
+        dirty: false,
+        hover_cell: None,
+        hover_link: None,
+        // SAFETY: the function has no arguments and only reads the token of this process.
+        admin: unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 },
     };
-    // Start the shell before the window and the GPU. The shell starts while the GPU starts.
     render::tick(start, "event loop");
-    app.new_tab();
+    // Start the shell before the window and the GPU. The shell starts while the GPU starts.
+    app.new_tab(first_profile);
     render::tick(start, "shell spawned");
     event_loop.run_app(&mut app).expect("run");
 }
@@ -1511,5 +2529,61 @@ mod tests {
         root.leaves(&mut leaves);
         assert_eq!(leaves, [1, 3]);
         assert!(Node::Leaf(1).remove(1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+
+    #[test]
+    fn colon_popup_lists_commands_and_restart_arguments() {
+        let names = |text: &str| colon_items(text).into_iter().map(|(n, ..)| n).collect::<Vec<_>>();
+        assert_eq!(names("t"), [":tab", ":theme"]);
+        assert_eq!(names("restart"), ["restore", "force", "clean"]);
+        assert_eq!(names("restart f"), ["force"]);
+        assert!(names("zzz").is_empty());
+    }
+
+    #[test]
+    fn fuzzy_finds_characters_in_order() {
+        assert_eq!(fuzzy("Restart shell", "rsc"), None);
+        assert_eq!(fuzzy("Restart shell \u{b7} clean", "rsc"), Some(vec![0, 2, 17]));
+        assert_eq!(fuzzy("New tab", ""), Some(vec![]));
+    }
+
+    #[test]
+    fn settings_text_reads_back_the_same() {
+        let (mut settings, bottom) = Settings::parse("theme=light\nposition=bottom\ncursor=block\nfont_size=99\nbad line\n");
+        assert!(bottom && settings.theme == 1 && settings.cursor == 1 && settings.font_px == 24.0 && settings.minimap);
+        settings.minimap = false;
+        settings.profile = Some(Profile::Cmd);
+        let (again, bottom) = Settings::parse(&settings.to_text(false));
+        assert!(!bottom && again == settings);
+    }
+
+    #[test]
+    fn animation_value_moves_to_the_target() {
+        let mut anim = Anim { on: true, dt: 0.016, ..Default::default() };
+        assert_eq!(anim.to(1, 5.0, 0.1), 5.0);
+        anim.set(1, 0.0);
+        let first = anim.to(1, 10.0, 0.1);
+        assert!(first > 0.0 && first < 10.0 && anim.active);
+        for _ in 0..100 {
+            anim.to(1, 10.0, 0.1);
+        }
+        assert_eq!(anim.to(1, 10.0, 0.1), 10.0);
+        anim.on = false;
+        assert_eq!(anim.to(1, 3.0, 0.1), 3.0);
+    }
+
+    #[test]
+    fn find_pattern_follows_the_toggles() {
+        let mut find = Find { query: "a.b".into(), ..Default::default() };
+        assert_eq!(find.pattern(), r"(?i:a\.b)");
+        find.regex = true;
+        find.case = true;
+        find.word = true;
+        assert_eq!(find.pattern(), r"(?-i:(?-u:\b)(?:a.b)(?-u:\b))");
     }
 }
