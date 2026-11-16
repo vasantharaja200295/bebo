@@ -463,13 +463,24 @@ Measured in bebo with 200,000 JSON lines (35 MB):
 - The shield button started an administrator window.
 - Unit tests: 10 pass.
 
+### Tested later with test aids (2026-11-17)
+
+- `Ctrl+K` clears the output. `Ctrl+,` opens the settings tab. `Ctrl+Shift+P` opens the palette.
+- Esc closes the font list, and a second Esc closes the settings tab.
+- The mouse wheel moves the font list.
+- 24 frames during typing at 180 ms and at 40 ms for each character: the accent bar is in each frame, and the caret is at positions between the cells.
+- A frame 25 ms after the palette opens shows the palette during its fade.
+
+The caret speed follows the typing speed. Its time constant is 30 % of the smoothed time between two characters, from 8 ms to 60 ms.
+
 ### Not tested
 
-- All key chords (`Ctrl+K`, `Ctrl+,`, Esc in the settings tab). The test tool cannot press them.
-- The animations in motion. A screenshot shows only the end position.
-- The "Administrator" label in the administrator window.
-- The mouse wheel in the font list.
+- The "Administrator" label in the administrator window. A test must not open the Windows consent prompt.
 - The prompt redraw after a resize with PowerShell 7, and with a prompt of two or more lines.
+
+### Test aids
+
+- With `BEBO_TEST` set, F9 changes the Ctrl state and F10 changes the Shift state. The window opens without keyboard focus.
 
 ### Known limits
 
@@ -477,3 +488,14 @@ Measured in bebo with 200,000 JSON lines (35 MB):
 - The prompt redraw after a resize is not done for a command of two or more lines.
 - While a full-screen program runs, a grow of the pane can remove lines of the main screen.
 - The font list has no search. Each row uses the interface font, not its own font.
+
+## 12. Small changes (2026-11-17)
+
+| Change | How it works |
+|---|---|
+| Caret at the start | The caret moves smoothly only in the 400 ms after a key press. At the start and for shell output it goes to its position immediately. |
+| New tab folder | A new tab starts in the home folder. The first tab starts in the folder of the bebo process. A split keeps the folder of its pane. |
+| Tab name | The name is the profile: PowerShell, Windows PowerShell, Command Prompt, WSL. The program path and the folder name are not used. A program that sets a different title (for example vim) changes the name. |
+| Find text | A text longer than the box moves to the left. The end of the text and the caret stay in view. |
+
+Tested in the window: 45 frames at the start show the caret at column 0 and then at the prompt end, with no position between them. The tab name, the home folder of a new tab, and a long find text are correct.

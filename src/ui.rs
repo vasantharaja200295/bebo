@@ -118,6 +118,9 @@ impl App {
         anim.dt = if anim.active { (now - self.last_frame).as_secs_f32().min(0.05) } else { 1.0 / 60.0 };
         anim.active = false;
         anim.on = self.settings.animations;
+        // The caret needs about one third of the time between two typed characters: 60 ms for slow typing, 8 ms for a held key.
+        anim.caret_tau = (self.key_gap * 0.3).clamp(0.008, 0.06);
+        anim.caret_live = self.last_input.elapsed() < Duration::from_millis(400);
         self.last_frame = now;
         // A closed popup opens from the start the next time.
         let popups = [
@@ -267,7 +270,7 @@ impl App {
             x = (x + 27.0 * s + ui.width(&title, Font::Ui, 12.0)).min(limit);
         } else {
             let available = ui.w - buttons - x - 70.0 * s;
-            let tab_w = (available / self.tabs.len() as f32).min(170.0 * s);
+            let tab_w = (available / self.tabs.len() as f32).min(200.0 * s);
             for (i, tab) in self.tabs.iter().enumerate() {
                 let r = Rect { x, y: 4.0 * s, w: tab_w - 4.0 * s, h: m.bar - 8.0 * s };
                 let (active, hot) = (i == self.active, ui.hot(r));
@@ -731,8 +734,15 @@ fn draw_find(ui: &mut Ui, m: &Metrics, rect: Rect, find: &Find) {
         ui.hit(b, Hit::FindToggle(2 - i as u8));
         x -= 22.0 * s;
     }
-    ui.clip = [input.x, r.y, x - 4.0 * s, r.y + r.h];
-    ui.text(input.x + 8.0 * s, mid, &format!("{}\u{2502}", find.query), t.fg, Font::Mono, 11.5, Align::Left);
+    // A long text moves to the left, so that its end and the caret stay in view.
+    let text = format!("{}\u{2502}", find.query);
+    let (left, right) = (input.x + 8.0 * s, x - 6.0 * s);
+    ui.clip = [input.x + 4.0 * s, r.y, x - 4.0 * s, r.y + r.h];
+    if ui.width(&text, Font::Mono, 11.5) > right - left {
+        ui.text(right, mid, &text, t.fg, Font::Mono, 11.5, Align::Right);
+    } else {
+        ui.text(left, mid, &text, t.fg, Font::Mono, 11.5, Align::Left);
+    }
     ui.clip = [0.0, 0.0, ui.w, ui.h];
 }
 
@@ -946,7 +956,7 @@ fn draw_pane(
         let target = x + colon_text.as_ref().map_or(0.0, |text| text.chars().count() as f32 * cw);
         // The caret moves smoothly along its row. A different row is an immediate change.
         let (key_x, key_y) = (A_CARET + 2 * id as u32, A_CARET + 2 * id as u32 + 1);
-        let caret = if anim.values.get(&key_y) == Some(&y) { anim.to(key_x, target, 0.4) } else { target };
+        let caret = if anim.caret_live && anim.values.get(&key_y) == Some(&y) { anim.to_in(key_x, target, 0.4, anim.caret_tau) } else { target };
         anim.set(key_x, caret);
         anim.set(key_y, y);
         if let Some(text) = colon_text {

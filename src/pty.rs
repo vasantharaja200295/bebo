@@ -196,6 +196,16 @@ impl Profile {
         }
     }
 
+    /// The title of a tab with this shell.
+    pub fn label(self) -> &'static str {
+        match self {
+            Profile::Pwsh => "PowerShell",
+            Profile::PowerShell => "Windows PowerShell",
+            Profile::Cmd => "Command Prompt",
+            Profile::Wsl => "WSL",
+        }
+    }
+
     /// Short text for the square badge in a tab.
     pub fn badge(self) -> &'static str {
         match self {
@@ -205,7 +215,7 @@ impl Profile {
         }
     }
 
-    fn program(self) -> &'static str {
+    pub fn program(self) -> &'static str {
         match self {
             Profile::Pwsh => "pwsh.exe",
             Profile::PowerShell => "powershell.exe",

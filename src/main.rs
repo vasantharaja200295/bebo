@@ -457,18 +457,26 @@ struct Anim {
     on: bool,
     /// A value moved in this frame. `draw` then asks for the next frame.
     active: bool,
+    /// Time constant of the caret in seconds. `draw` calculates it from the typing speed.
+    caret_tau: f32,
+    /// The user pressed a key a moment ago. Only then the caret moves smoothly: not at the start and not for shell output.
+    caret_live: bool,
 }
 
 impl Anim {
     /// Moves the value of `key` in the direction of `target` and returns it. The first call returns `target`.
     /// The value stops when it is nearer than `near` to the target.
     fn to(&mut self, key: u32, target: f32, near: f32) -> f32 {
+        self.to_in(key, target, near, 0.045)
+    }
+
+    /// As `to`, with the time constant `tau` in seconds. The value goes 63 % of the distance in that time.
+    fn to_in(&mut self, key: u32, target: f32, near: f32, tau: f32) -> f32 {
         let value = self.values.entry(key).or_insert(target);
         if !self.on || (target - *value).abs() < near {
             *value = target;
         } else {
-            // The value goes 63 % of the distance in 45 ms.
-            *value += (target - *value) * (1.0 - (-self.dt / 0.045).exp());
+            *value += (target - *value) * (1.0 - (-self.dt / tau).exp());
             self.active = true;
         }
         *value
@@ -643,6 +651,11 @@ struct App {
     last_frame: Instant,
     /// A shell has new output that is not on the screen.
     dirty: bool,
+    /// Time of the last typed character, and the smoothed time between characters in seconds.
+    last_key: Instant,
+    key_gap: f32,
+    /// Time of the last key press of all types.
+    last_input: Instant,
     /// The cell below the mouse: (pane, cell).
     hover_cell: Option<(usize, Point)>,
     /// The link below the mouse: (pane, grid line, first column, last column).
@@ -708,7 +721,7 @@ impl App {
             input_start: None,
             await_input: false,
             cwd,
-            title: profile.name().into(),
+            title: profile.label().into(),
             blocks: Vec::new(),
             view_top: 0,
             cursor_px: None,
@@ -724,7 +737,9 @@ impl App {
     }
 
     fn new_tab(&mut self, profile: Option<Profile>) {
-        let cwd = self.focus_pane().and_then(|p| p.cwd.clone());
+        // A new tab starts in the home folder. The first tab starts in the folder of the bebo process.
+        // A split keeps the folder of its pane: see `split`.
+        let cwd = if self.tabs.is_empty() { None } else { std::env::var_os("USERPROFILE").map(PathBuf::from) };
         let profile = profile.or(self.focus_pane().map(|p| p.profile)).unwrap_or_else(Profile::default_profile);
         let size = self.focus_pane().map_or((100, 30), |p| (p.cols, p.rows));
         let id = self.new_pane(cwd, profile, size);
@@ -1716,6 +1731,14 @@ impl App {
         if event.state != ElementState::Pressed {
             return;
         }
+        self.last_input = Instant::now();
+        // Test aid: the test tool cannot hold a key. With BEBO_TEST, F9 changes the Ctrl state and F10 changes the Shift state.
+        if let Key::Named(named @ (NamedKey::F9 | NamedKey::F10)) = &event.logical_key
+            && std::env::var_os("BEBO_TEST").is_some()
+        {
+            self.mods.toggle(if *named == NamedKey::F9 { ModifiersState::CONTROL } else { ModifiersState::SHIFT });
+            return;
+        }
         let (ctrl, shift, alt) = (self.mods.control_key(), self.mods.shift_key(), self.mods.alt_key());
         let key = event.logical_key.clone();
         let text = event.text.as_deref().filter(|t| !t.chars().any(char::is_control));
@@ -1909,6 +1932,13 @@ impl App {
         let plain = !ctrl && !alt;
         let is_text = plain && matches!(key, Key::Character(_) | Key::Named(NamedKey::Space));
         let is_delete = plain && matches!(key, Key::Named(NamedKey::Backspace | NamedKey::Delete));
+        if is_text || is_delete {
+            // The caret animation follows the typing speed. A pause counts as 0.4 s at most.
+            let now = Instant::now();
+            let gap = (now - self.last_key).as_secs_f32().min(0.4);
+            self.key_gap = self.key_gap * 0.6 + gap * 0.4;
+            self.last_key = now;
+        }
         let region = Region::new(pane, &term);
         let edit = if is_text || is_delete { region.as_ref().and_then(|r| r.delete_selection(&term)) } else { None };
         // Keep the command text for the restart confirm.
@@ -1965,6 +1995,8 @@ impl App {
                 // `about_to_wait` draws the output, with a limit on the number of frames in a second.
                 self.dirty = true;
             },
+            // A shell sets its program path as the title. The tab then keeps the name of the profile.
+            Event::Title(title) if title.to_ascii_lowercase().contains(pane.profile.program()) => {},
             Event::Title(title) => {
                 pane.title = title;
                 if id == self.focus() {
@@ -2013,10 +2045,7 @@ impl App {
                 }
             },
             Mark::Cwd(path) => {
-                let path = PathBuf::from(path);
-                // The tab title is the folder name.
-                pane.title = path.file_name().map_or(path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
-                pane.cwd = Some(path);
+                pane.cwd = Some(PathBuf::from(path));
                 self.relayout();
             },
             Mark::Restart => self.request_restart(id, false, false),
@@ -2476,6 +2505,9 @@ fn main() {
         anim: Anim::default(),
         last_frame: start,
         dirty: false,
+        last_key: start,
+        key_gap: 0.2,
+        last_input: start,
         hover_cell: None,
         hover_link: None,
         // SAFETY: the function has no arguments and only reads the token of this process.
@@ -2573,6 +2605,10 @@ mod ui_tests {
             anim.to(1, 10.0, 0.1);
         }
         assert_eq!(anim.to(1, 10.0, 0.1), 10.0);
+        // A shorter time constant moves the value farther in one frame.
+        anim.set(2, 0.0);
+        anim.set(3, 0.0);
+        assert!(anim.to_in(2, 10.0, 0.1, 0.01) > anim.to_in(3, 10.0, 0.1, 0.06));
         anim.on = false;
         assert_eq!(anim.to(1, 3.0, 0.1), 3.0);
     }
