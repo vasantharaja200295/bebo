@@ -66,7 +66,7 @@ impl Ui<'_> {
         let size = (size * self.s).round();
         let y = mid - (size * 1.4).ceil() / 2.0 + self.dy;
         let layer = if self.popup { &mut self.frame.popup_rows } else { &mut self.frame.top_rows };
-        layer.push(Row { x, y, clip: self.clip, spans, font, size, align, fade: self.fade });
+        layer.push(Row { x, y, clip: self.clip, spans, font, size, align, fade: self.fade, image: None });
     }
 
     fn text(&mut self, x: f32, mid: f32, text: &str, color: Rgb, font: Font, size: f32, align: Align) {
@@ -85,18 +85,19 @@ impl Ui<'_> {
         self.hits.push((Rect { y: r.y + self.dy, ..r }, hit));
     }
 
-    /// The square badge of a shell profile.
+    /// An image with its left edge at `x` and its vertical center at `mid`. `size` is in logical pixels.
+    /// Image `id` is the version for the dark theme, and `id + 10` is the version for the light theme.
+    fn image(&mut self, x: f32, mid: f32, id: u16, size: f32) {
+        let id = if self.t.dark { id } else { id + 10 };
+        let px = self.gpu.image_size(id, size * self.s);
+        let row = Row { x: x.round(), y: (mid - px as f32 / 2.0).round() + self.dy, clip: self.clip, image: Some((id, px)), ..Default::default() };
+        let layer = if self.popup { &mut self.frame.popup_rows } else { &mut self.frame.top_rows };
+        layer.push(row);
+    }
+
+    /// The icon of a shell profile, 16 pixels wide.
     fn badge(&mut self, x: f32, mid: f32, profile: Profile) {
-        let s = self.s;
-        let color = match profile {
-            Profile::Pwsh => [0x2f, 0x6f, 0xd6],
-            Profile::PowerShell => [0x2a, 0x5a, 0xa8],
-            Profile::Cmd => [0x4b, 0x52, 0x63],
-            Profile::Wsl => [0xd9, 0x60, 0x1e],
-        };
-        let r = Rect { x, y: mid - 7.0 * s, w: 15.0 * s, h: 14.0 * s };
-        self.rect(r, color, 255, 3.0 * s);
-        self.text(r.x + r.w / 2.0, mid, profile.badge(), WHITE, Font::UiBold, 7.5, Align::Center);
+        self.image(x, mid, profile.image(), 16.0);
     }
 }
 
@@ -230,10 +231,8 @@ impl App {
         ui.hit(bar, Hit::TitleDrag);
 
         let mut x = 10.0 * s;
-        let logo = Rect { x, y: mid - 7.0 * s, w: 14.0 * s, h: 14.0 * s };
-        ui.rect(logo, t.accent, 255, 4.0 * s);
-        ui.text(logo.x + logo.w / 2.0, mid - s, "b", t.bar, Font::UiBold, 10.0, Align::Center);
-        x += 20.0 * s;
+        ui.image(x - s, mid, 0, 16.0);
+        x += 21.0 * s;
         ui.text(x, mid, "bebo", t.fg, Font::UiBold, 12.0, Align::Left);
         x += ui.width("bebo", Font::UiBold, 12.0) + 10.0 * s;
         if self.admin {
@@ -269,10 +268,15 @@ impl App {
             ui.clip = [0.0, 0.0, ui.w, ui.h];
             x = (x + 27.0 * s + ui.width(&title, Font::Ui, 12.0)).min(limit);
         } else {
+            // The tabs share the width. A narrow tab shows only its icon.
+            // ponytail: below 24 px for each tab, the tabs go behind the window buttons. Add a tab list popup for that number of tabs.
             let available = ui.w - buttons - x - 70.0 * s;
-            let tab_w = (available / self.tabs.len() as f32).min(200.0 * s);
+            let tab_w = (available / self.tabs.len() as f32).clamp(24.0 * s, 200.0 * s);
+            let compact = tab_w < 80.0 * s;
+            // The tab below the mouse that does not show its full name: (center, name).
+            let mut tip: Option<(f32, String)> = None;
             for (i, tab) in self.tabs.iter().enumerate() {
-                let r = Rect { x, y: 4.0 * s, w: tab_w - 4.0 * s, h: m.bar - 8.0 * s };
+                let r = Rect { x, y: 4.0 * s, w: tab_w - 3.0 * s, h: m.bar - 8.0 * s };
                 let (active, hot) = (i == self.active, ui.hot(r));
                 if active {
                     ui.panel(r, t.bg, 5.0 * s);
@@ -281,29 +285,50 @@ impl App {
                 }
                 ui.hit(r, Hit::Tab(i));
                 let color = if active { t.fg } else { t.dim };
-                let title = match self.panes.get(&tab.focus) {
-                    Some(pane) => {
-                        ui.badge(r.x + 7.0 * s, mid, pane.profile);
-                        self.tab_title(i, pane)
-                    },
-                    None => {
-                        ui.icon(r.x + 14.0 * s, mid, Icon::Settings, color, 12.0);
-                        "Settings".to_string()
-                    },
+                let pane = self.panes.get(&tab.focus);
+                let title = pane.map_or("Settings".to_string(), |pane| self.tab_title(i, pane));
+                // A narrow tab has the icon in its middle. On the active tab, the close button replaces the icon below the mouse.
+                // A tab that is not active keeps its icon, so that a click selects the tab and does not close it.
+                let icon_x = if compact { r.x + (r.w - 16.0 * s) / 2.0 } else { r.x + 7.0 * s };
+                let close = if compact {
+                    Rect { x: icon_x, y: mid - 8.0 * s, w: 16.0 * s, h: 16.0 * s }
+                } else {
+                    Rect { x: r.x + r.w - 21.0 * s, y: mid - 8.0 * s, w: 16.0 * s, h: 16.0 * s }
                 };
-                ui.clip = [r.x, 0.0, r.x + r.w - 22.0 * s, m.bar];
-                ui.text(r.x + 28.0 * s, mid, &title, color, Font::Ui, 12.0, Align::Left);
-                ui.clip = [0.0, 0.0, ui.w, ui.h];
-                if active || hot {
-                    let close = Rect { x: r.x + r.w - 21.0 * s, y: mid - 8.0 * s, w: 16.0 * s, h: 16.0 * s };
+                let show_close = if compact { hot && active } else { active || hot };
+                if !(compact && show_close) {
+                    match pane {
+                        Some(pane) => ui.badge(icon_x, mid, pane.profile),
+                        None => ui.icon(icon_x + 8.0 * s, mid, Icon::Settings, color, 12.0),
+                    }
+                }
+                let room = r.w - 28.0 * s - 24.0 * s;
+                if !compact {
+                    ui.clip = [r.x, 0.0, r.x + 28.0 * s + room, m.bar];
+                    ui.text(r.x + 28.0 * s, mid, &title, color, Font::Ui, 12.0, Align::Left);
+                    ui.clip = [0.0, 0.0, ui.w, ui.h];
+                }
+                if show_close {
                     let close_hot = ui.hot(close);
                     if close_hot {
-                        ui.rect(close, t.panel_hi, 255, 4.0 * s);
+                        ui.rect(close, mix(t.panel_hi, t.fg, 0.12), 255, 4.0 * s);
                     }
                     ui.icon(close.x + close.w / 2.0, mid, Icon::X, if close_hot { t.fg } else { t.dim }, 11.0);
                     ui.hit(close, Hit::TabClose(i));
                 }
+                if hot && (compact || ui.width(&title, Font::Ui, 12.0) > room) {
+                    tip = Some((r.x + r.w / 2.0, title));
+                }
                 x += tab_w;
+            }
+            // The full name shows below a tab that has no room for it.
+            if let Some((center, title)) = tip.filter(|_| !self.menu && self.palette.is_none()) {
+                let width = ui.width(&title, Font::Ui, 11.5) + 18.0 * s;
+                let r = Rect { x: (center - width / 2.0).clamp(4.0 * s, (ui.w - width - 4.0 * s).max(4.0 * s)), y: m.bar + 3.0 * s, w: width, h: 24.0 * s };
+                ui.popup = true;
+                ui.panel(r, t.panel, 5.0 * s);
+                ui.text(r.x + r.w / 2.0, r.y + r.h / 2.0, &title, t.fg, Font::Ui, 11.5, Align::Center);
+                ui.popup = false;
             }
         }
 

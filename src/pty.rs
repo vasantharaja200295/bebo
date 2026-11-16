@@ -206,12 +206,12 @@ impl Profile {
         }
     }
 
-    /// Short text for the square badge in a tab.
-    pub fn badge(self) -> &'static str {
+    /// Id of the icon of this shell. See `IMAGES` in main.rs.
+    pub fn image(self) -> u16 {
         match self {
-            Profile::Pwsh | Profile::PowerShell => "PS",
-            Profile::Cmd => ">_",
-            Profile::Wsl => "Lx",
+            Profile::Pwsh | Profile::PowerShell => 1,
+            Profile::Cmd => 2,
+            Profile::Wsl => 3,
         }
     }
 

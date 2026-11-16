@@ -5,8 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, Style,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap, fontdb,
+    Attrs, Buffer, Cache, Color, ContentType, CustomGlyph, Family, FontSystem, Metrics, RasterizedCustomGlyph, Resolution,
+    Shaping, Style, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, Wrap, fontdb,
 };
 use winit::window::Window;
 
@@ -63,6 +63,9 @@ pub struct Row {
     pub align: Align,
     /// Transparency. 0 is opaque and 255 is invisible.
     pub fade: u8,
+    /// An image with its top left corner at (`x`, `y`): the image id and its size in pixels.
+    /// Get the size from `Gpu::image_size`. A row with an image has no text.
+    pub image: Option<(u16, u16)>,
 }
 
 #[derive(Default)]
@@ -172,6 +175,8 @@ pub struct Gpu {
     /// All installed font families: (name, fixed width). Empty until `families` reads the system fonts.
     families: Vec<(String, bool)>,
     ui: String,
+    /// Images as RGBA pixels. The key is the image id and the size in pixels (the images are squares).
+    images: HashMap<(u16, u16), Vec<u8>>,
     /// Shaped text for each row content. The key is the hash of the row.
     row_cache: HashMap<u64, (Buffer, f32, u64)>,
     frame_number: u64,
@@ -248,8 +253,7 @@ impl Gpu {
         // Load only the fonts that bebo uses. A scan of all system fonts is slow.
         let mut db = fontdb::Database::new();
         let user_fonts = std::env::var("LOCALAPPDATA").unwrap_or_default() + r"\Microsoft\Windows\Fonts\";
-        // Inter is the interface font. If it is not installed, Segoe UI is the interface font.
-        for file in ["JetBrainsMonoNL-Regular.ttf", "JetBrainsMonoNL-Bold.ttf", "JetBrainsMonoNL-Italic.ttf", "Inter.ttc"] {
+        for file in ["JetBrainsMonoNL-Regular.ttf", "JetBrainsMonoNL-Bold.ttf", "JetBrainsMonoNL-Italic.ttf"] {
             if db.load_font_file(format!("{user_fonts}{file}")).is_err() {
                 let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
             }
@@ -262,9 +266,13 @@ impl Gpu {
             let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
         }
         db.load_font_source(fontdb::Source::Binary(Arc::new(lucide_icons::LUCIDE_FONT_BYTES)));
+        // Geist is the interface font. The two weights are inside bebo.exe (Open Font License, see assets/fonts/OFL.txt).
+        // Segoe UI gives the characters that Geist does not have.
+        db.load_font_source(fontdb::Source::Binary(Arc::new(include_bytes!("../assets/fonts/Geist-Regular.ttf"))));
+        db.load_font_source(fontdb::Source::Binary(Arc::new(include_bytes!("../assets/fonts/Geist-SemiBold.ttf"))));
         let has = |name: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
         let mono = ["JetBrains Mono NL", "Cascadia Mono", "Consolas"].into_iter().find(|n| has(n)).unwrap_or("Consolas").to_string();
-        let ui = if has("Inter") { "Inter" } else { "Segoe UI" }.to_string();
+        let ui = "Geist".to_string();
         let font_system = FontSystem::new_with_locale_and_db("en-US".into(), db);
         tick(t0, "fonts");
 
@@ -292,6 +300,7 @@ impl Gpu {
             mono,
             families: Vec::new(),
             ui,
+            images: HashMap::new(),
             row_cache: HashMap::new(),
             frame_number: 0,
             font_px,
@@ -310,6 +319,26 @@ impl Gpu {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
+    }
+
+    /// Adds one size of an image from PNG data. An image id can have many sizes.
+    pub fn add_image(&mut self, id: u16, data: &[u8]) {
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+        decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+        let Ok(mut reader) = decoder.read_info() else { return };
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap_or(0)];
+        let Ok(info) = reader.next_frame(&mut pixels) else { return };
+        pixels.truncate(info.buffer_size());
+        // Only square RGBA images are accepted.
+        if info.width == info.height && pixels.len() == (info.width * info.height * 4) as usize {
+            self.images.insert((id, info.width as u16), pixels);
+        }
+    }
+
+    /// The size of image `id` that is nearest to `want` pixels. bebo does not scale images.
+    pub fn image_size(&self, id: u16, want: f32) -> u16 {
+        let sizes = self.images.keys().filter(|key| key.0 == id).map(|key| key.1);
+        sizes.min_by_key(|size| (*size as f32 - want).abs() as u32).unwrap_or(0)
     }
 
     pub fn mono(&self) -> &str {
@@ -431,7 +460,24 @@ impl Gpu {
 
         for (layer, rows) in [&frame.rows, &frame.top_rows, &frame.popup_rows].into_iter().enumerate() {
             let shaped: Vec<(u64, f32)> = rows.iter().map(|row| self.shape(row)).collect();
-            let areas = rows.iter().zip(&shaped).map(|(row, (key, w))| TextArea {
+            // An image is a custom glyph of its row.
+            let glyphs: Vec<Option<CustomGlyph>> = rows
+                .iter()
+                .map(|row| {
+                    row.image.map(|(id, size)| CustomGlyph {
+                        id,
+                        left: 0.0,
+                        top: 0.0,
+                        width: size as f32,
+                        height: size as f32,
+                        color: None,
+                        snap_to_physical_pixel: true,
+                        metadata: 0,
+                    })
+                })
+                .collect();
+            let images = &self.images;
+            let areas = rows.iter().zip(&shaped).zip(&glyphs).map(|((row, (key, w)), glyph)| TextArea {
                 buffer: &self.row_cache[key].0,
                 left: match row.align {
                     Align::Left => row.x,
@@ -447,10 +493,10 @@ impl Gpu {
                     bottom: row.clip[3] as i32,
                 },
                 default_color: Color::rgb(255, 255, 255),
-                custom_glyphs: &[],
+                custom_glyphs: glyph.as_slice(),
             });
             self.text[layer]
-                .prepare(
+                .prepare_with_custom(
                     &self.device,
                     &self.queue,
                     &mut self.font_system,
@@ -458,6 +504,10 @@ impl Gpu {
                     &self.viewport,
                     areas,
                     &mut self.swash_cache,
+                    |request| {
+                        let data = images.get(&(request.id, request.width))?.clone();
+                        Some(RasterizedCustomGlyph { data, content_type: ContentType::Color })
+                    },
                 )
                 .expect("prepare text");
         }

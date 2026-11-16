@@ -499,3 +499,21 @@ The caret speed follows the typing speed. Its time constant is 30 % of the smoot
 | Find text | A text longer than the box moves to the left. The end of the text and the caret stay in view. |
 
 Tested in the window: 45 frames at the start show the caret at column 0 and then at the prompt end, with no position between them. The tab name, the home folder of a new tab, and a long find text are correct.
+
+## 13. Tab bar and icons (2026-11-17)
+
+| Change | How it works |
+|---|---|
+| Crowded tab bar | The tabs share the width. A tab narrower than 80 px shows only its icon, in the middle. |
+| Close button in a narrow tab | On the active tab, the close button replaces the icon below the mouse. A tab that is not active keeps its icon, so that a click selects it. |
+| Name popover | A tab that has no room for its full name shows the name below the tab, below the mouse. |
+| Rename | A double click on a tab opens the rename box with the current name. `:rename name` gives the name directly. `:rename` alone opens the box. |
+| Shell icons | Tabs and the profile menu show the icons from the icon pack: PowerShell, Command Prompt, WSL. The clear version for a dark or a light surface follows the theme. |
+| bebo icon | The title bar shows the bebo icon. The program file has the dark and the light `.ico`. The window and the taskbar use the one for the app mode of Windows, read at the start. |
+
+- The images are PNG files in `assets/`, in the sizes 16, 20, 24, and 32 px. The build puts them into `bebo.exe`. bebo does not scale images: it draws the size nearest to 16 px times the display scale.
+- The renderer draws an image as a custom glyph of glyphon. The `png` crate decodes the files. `build.rs` adds the `.ico` files with the `winresource` crate.
+- The interface font is Geist (Regular and SemiBold, version 1.9.2, Open Font License). The two files are in `assets/fonts` and the build puts them into `bebo.exe`. Inter is not used now.
+- Limit: with more than about 30 tabs in a 1000 px window, the tabs go behind the window buttons.
+
+Tested in the window: 3 tabs and 25 tabs, the profile menu, the close button and the popover on a narrow tab, a double click rename, `:rename my server`, and the icon of the program file. Unit tests: 10 pass.

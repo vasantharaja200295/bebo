@@ -27,8 +27,8 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::platform::windows::WindowAttributesExtWindows;
-use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
+use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
+use winit::window::{CursorIcon, Icon, ResizeDirection, Window, WindowId};
 
 use pty::{Mark, Profile, Proxy, SharedTerm, TermSize, UserEvent};
 use render::Gpu;
@@ -351,6 +351,10 @@ fn colon_items(text: &str) -> Vec<(String, &'static str, &'static str)> {
         let last = if text.ends_with(' ') || text == "restart" { "" } else { text.rsplit(' ').next().unwrap_or("") };
         return RESTART_ARGS.iter().filter(|(n, _)| n.starts_with(last)).map(|(n, d)| (n.to_string(), *d, "")).collect();
     }
+    if let Some(name) = text.strip_prefix("rename ") {
+        let hint = if name.trim().is_empty() { "Type the new name. Enter with no name removes the name." } else { "Enter gives this name to the tab" };
+        return vec![(":rename".to_string(), hint, "")];
+    }
     COLON.iter().filter(|(n, ..)| n.starts_with(text)).map(|(n, d, k, _)| (format!(":{n}"), *d, *k)).collect()
 }
 
@@ -430,6 +434,20 @@ enum Hit {
     SettingsPage(usize),
     /// A popup. A click here does nothing and does not go to the terminal.
     Block,
+}
+
+/// Adds the four sizes of the dark and the light version of an icon. The light version has the id + 10.
+macro_rules! add_icon {
+    ($gpu:expr, $id:expr, $name:literal) => {
+        $gpu.add_image($id, include_bytes!(concat!("../assets/", $name, "-dark-16.png")));
+        $gpu.add_image($id, include_bytes!(concat!("../assets/", $name, "-dark-20.png")));
+        $gpu.add_image($id, include_bytes!(concat!("../assets/", $name, "-dark-24.png")));
+        $gpu.add_image($id, include_bytes!(concat!("../assets/", $name, "-dark-32.png")));
+        $gpu.add_image($id + 10, include_bytes!(concat!("../assets/", $name, "-light-16.png")));
+        $gpu.add_image($id + 10, include_bytes!(concat!("../assets/", $name, "-light-20.png")));
+        $gpu.add_image($id + 10, include_bytes!(concat!("../assets/", $name, "-light-24.png")));
+        $gpu.add_image($id + 10, include_bytes!(concat!("../assets/", $name, "-light-32.png")));
+    };
 }
 
 /// Number of rows in the font list of the settings page.
@@ -627,6 +645,8 @@ struct App {
     drag_minimap: Option<usize>,
     last_click: (Instant, Point, u8),
     last_title_click: Instant,
+    /// Time and tab of the last click on a tab. A double click renames the tab.
+    last_tab_click: (Instant, usize),
     clipboard: Option<arboard::Clipboard>,
     profiles: Vec<Profile>,
     theme: Theme,
@@ -662,6 +682,8 @@ struct App {
     hover_link: Option<(usize, i32, usize, usize)>,
     /// bebo runs as administrator.
     admin: bool,
+    /// The icon of the window and of the taskbar button.
+    icon: Option<Icon>,
 }
 
 impl App {
@@ -893,6 +915,11 @@ impl App {
         self.scale = window.scale_factor() as f32;
         let mut gpu = Gpu::new(window, parts, self.settings.font_px * self.scale, self.start);
         gpu.set_mono(&self.settings.font);
+        // Image ids: 0 is the bebo icon. 1 to 3 are the shell icons, see `Profile::image`.
+        add_icon!(gpu, 0, "app/bebo");
+        add_icon!(gpu, 1, "shell/powershell");
+        add_icon!(gpu, 2, "shell/cmd");
+        add_icon!(gpu, 3, "shell/wsl");
         self.gpu = Some(gpu);
         render::tick(self.start, "gpu ready");
         self.relayout();
@@ -1110,8 +1137,20 @@ impl App {
                 }
             },
             Hit::Tab(i) => {
+                let now = Instant::now();
+                let double = self.last_tab_click.1 == i && now - self.last_tab_click.0 < Duration::from_millis(400);
+                self.last_tab_click = (now, i);
                 self.active = i;
+                // A double click opens the rename box with the current name.
+                if double && !self.tabs[i].settings {
+                    let query = self.tabs[i].name.clone().unwrap_or_default();
+                    self.palette = Some(Palette { rename: true, query, ..Default::default() });
+                }
                 self.relayout();
+            },
+            // The second click of a double click on a narrow tab is on its close button. It is a rename, not a close.
+            Hit::TabClose(i) if self.last_tab_click.1 == i && self.last_tab_click.0.elapsed() < Duration::from_millis(400) => {
+                self.click(Hit::Tab(i));
             },
             Hit::TabClose(i) => self.close_tab(i),
             Hit::NewTab => self.new_tab(None),
@@ -1635,6 +1674,13 @@ impl App {
         let focus = self.focus();
         let items = colon_items(&colon.text);
         let selected = items.get(colon.selected).map(|(name, ..)| name.trim_start_matches(':').to_string());
+        // `:rename name` gives the name to the tab. `:rename` alone opens the rename box.
+        if let Some(name) = colon.text.strip_prefix("rename ") {
+            let name = name.trim();
+            self.tabs[self.active].name = (!name.is_empty()).then(|| name.to_string());
+            self.relayout();
+            return;
+        }
         if colon.text == "restart" || colon.text.starts_with("restart ") {
             let mut words: Vec<&str> = colon.text.split_whitespace().skip(1).collect();
             // A part of a word selects the row of the popup.
@@ -1687,6 +1733,8 @@ impl App {
             Key::Named(NamedKey::Enter) => self.colon_run(),
             Key::Named(NamedKey::ArrowDown) => colon.selected = (colon.selected + 1) % count,
             Key::Named(NamedKey::ArrowUp) => colon.selected = (colon.selected + count - 1) % count,
+            // Tab completes a command name. It does not change the name after `rename`.
+            Key::Named(NamedKey::Tab) if colon.text.starts_with("rename ") => {},
             Key::Named(NamedKey::Tab) => {
                 if let Some((name, ..)) = colon_items(&colon.text).get(colon.selected) {
                     let name = name.trim_start_matches(':');
@@ -2146,6 +2194,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_decorations(false)
             // A test window does not take the keyboard focus from the user.
             .with_active(std::env::var_os("BEBO_TEST").is_none())
+            .with_window_icon(self.icon.clone())
+            .with_taskbar_icon(self.icon.clone())
             .with_undecorated_shadow(true);
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
         // The window shows immediately with the background color. The GPU frame comes when the device is ready.
@@ -2486,6 +2536,7 @@ fn main() {
         drag_minimap: None,
         last_click: (start, Point::new(Line(0), Column(0)), 0),
         last_title_click: start,
+        last_tab_click: (start, usize::MAX),
         clipboard: None,
         profiles,
         theme: settings.theme(),
@@ -2510,6 +2561,8 @@ fn main() {
         last_input: start,
         hover_cell: None,
         hover_link: None,
+        // The program file has two icons: 1 for the dark mode of Windows and 2 for the light mode. See build.rs.
+        icon: Icon::from_resource(if system_dark() { 1 } else { 2 }, None).ok(),
         // SAFETY: the function has no arguments and only reads the token of this process.
         admin: unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 },
     };
@@ -2574,6 +2627,7 @@ mod ui_tests {
         assert_eq!(names("t"), [":tab", ":theme"]);
         assert_eq!(names("restart"), ["restore", "force", "clean"]);
         assert_eq!(names("restart f"), ["force"]);
+        assert_eq!(names("rename my tab"), [":rename"]);
         assert!(names("zzz").is_empty());
     }
 
