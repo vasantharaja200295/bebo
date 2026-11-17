@@ -77,9 +77,9 @@ pub struct Frame {
     pub overlay: Vec<Quad>,
     /// Text above the overlay rectangles.
     pub top_rows: Vec<Row>,
-    /// Rectangles and text of popups. They are above all other layers.
-    pub popup: Vec<Quad>,
-    pub popup_rows: Vec<Row>,
+    /// Popups: rectangles and text of each popup. Each popup is a layer above the layers before it,
+    /// so that the text of one popup does not show through the next popup.
+    pub popups: Vec<(Vec<Quad>, Vec<Row>)>,
 }
 
 #[repr(C)]
@@ -169,8 +169,8 @@ pub struct Gpu {
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
-    /// One text renderer for each layer: terminal text, interface text, popup text.
-    text: [TextRenderer; 3],
+    /// One text renderer for each layer: terminal text, interface text, and one for each popup.
+    text: Vec<TextRenderer>,
     mono: String,
     /// All installed font families: (name, fixed width). Empty until `families` reads the system fonts.
     families: Vec<(String, bool)>,
@@ -261,6 +261,8 @@ impl Gpu {
         let system = [
             "CascadiaMono.ttf", "consola.ttf", "consolab.ttf", "segoeui.ttf", "seguisb.ttf", "seguisym.ttf",
             "seguiemj.ttf",
+            // Fallback fonts for Chinese, Japanese, Korean, and Indian scripts. fontdb maps the files and reads only the parts in use.
+            "msyh.ttc", "YuGothR.ttc", "malgun.ttf", "Nirmala.ttc",
         ];
         for file in system {
             let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
@@ -279,7 +281,7 @@ impl Gpu {
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let text = [(); 3].map(|_| TextRenderer::new(&mut atlas, &device, Default::default(), None));
+        let text = (0..3).map(|_| TextRenderer::new(&mut atlas, &device, Default::default(), None)).collect();
         tick(t0, "text renderer");
 
         let mut gpu = Self {
@@ -458,7 +460,11 @@ impl Gpu {
         let (width, height) = self.size();
         self.viewport.update(&self.queue, Resolution { width: self.config.width, height: self.config.height });
 
-        for (layer, rows) in [&frame.rows, &frame.top_rows, &frame.popup_rows].into_iter().enumerate() {
+        let layers: Vec<&Vec<Row>> = [&frame.rows, &frame.top_rows].into_iter().chain(frame.popups.iter().map(|p| &p.1)).collect();
+        while self.text.len() < layers.len() {
+            self.text.push(TextRenderer::new(&mut self.atlas, &self.device, Default::default(), None));
+        }
+        for (layer, rows) in layers.iter().enumerate() {
             let shaped: Vec<(u64, f32)> = rows.iter().map(|row| self.shape(row)).collect();
             // An image is a custom glyph of its row.
             let glyphs: Vec<Option<CustomGlyph>> = rows
@@ -513,8 +519,9 @@ impl Gpu {
         }
 
         // Rectangles: two triangles for each.
-        let mut vertices: Vec<Vertex> = Vec::with_capacity((frame.quads.len() + frame.overlay.len() + frame.popup.len()) * 6);
-        for q in frame.quads.iter().chain(&frame.overlay).chain(&frame.popup) {
+        let groups: Vec<&Vec<Quad>> = [&frame.quads, &frame.overlay].into_iter().chain(frame.popups.iter().map(|p| &p.0)).collect();
+        let mut vertices: Vec<Vertex> = Vec::with_capacity(groups.iter().map(|g| g.len()).sum::<usize>() * 6);
+        for q in groups.iter().flat_map(|g| g.iter()) {
             let color = [linear(q.color[0]), linear(q.color[1]), linear(q.color[2]), q.color[3] as f32 / 255.0];
             let (x0, y0) = (q.x / width * 2.0 - 1.0, 1.0 - q.y / height * 2.0);
             let (x1, y1) = ((q.x + q.w) / width * 2.0 - 1.0, 1.0 - (q.y + q.h) / height * 2.0);
@@ -532,10 +539,16 @@ impl Gpu {
             self.vertices = Self::vertex_buffer(&self.device, self.vertex_capacity);
         }
         self.queue.write_buffer(&self.vertices, 0, bytes);
-        // The vertex ranges of the three layers.
-        let below = frame.quads.len() as u32 * 6;
-        let middle = below + frame.overlay.len() as u32 * 6;
-        let total = vertices.len() as u32;
+        // The vertex range of each layer.
+        let mut start = 0;
+        let ranges: Vec<std::ops::Range<u32>> = groups
+            .iter()
+            .map(|g| {
+                let range = start..start + g.len() as u32 * 6;
+                start = range.end;
+                range
+            })
+            .collect();
 
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture) => texture,
@@ -575,8 +588,8 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // Order: rectangles, terminal text, overlay rectangles, overlay text, popup rectangles, popup text.
-            for (layer, range) in [0..below, below..middle, middle..total].into_iter().enumerate() {
+            // Order: rectangles, terminal text, overlay rectangles, overlay text, then the rectangles and the text of each popup.
+            for (layer, range) in ranges.into_iter().enumerate() {
                 if !range.is_empty() {
                     pass.set_pipeline(&self.pipeline);
                     pass.set_vertex_buffer(0, self.vertices.slice(..));

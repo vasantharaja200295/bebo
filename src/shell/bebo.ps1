@@ -1,9 +1,11 @@
 # bebo shell integration for PowerShell 5.1 and 7.
-# After a resize, PSReadLine has a wrong row for the prompt. bebo then sends Ctrl+F12, and the key handler draws the prompt again at the cursor row.
+# After a resize, PSReadLine has a wrong row for the prompt. bebo then sends Ctrl+F12, and the key handler draws the prompt again.
+# The handler does this only when the prompt and the command use one row. For two or more rows, the row of ConPTY and of bebo can be different by one.
 # bebo sends this file as one line. End each statement with ";". Do not use double quotes or comments in the code part.
 $global:__bebo_e = [string][char]27;
 $global:__bebo_b = [string][char]7;
 $global:__bebo_prompt = $function:prompt;
+try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $global:OutputEncoding = [Console]::OutputEncoding } catch { };
 function global:prompt {
   $ok = $?;
   $code = 0;
@@ -28,7 +30,12 @@ if (Get-Module PSReadLine) {
     $line = $null;
     $cursor = $null;
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor);
-    if (-not $line.Contains([string][char]10)) { [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt($null, [Console]::CursorTop) }
+    $e = $global:__bebo_e;
+    $b = $global:__bebo_b;
+    $p = [string](& $function:prompt);
+    $p = ($p -replace ($e + '\][^' + $b + ']*' + $b), '') -replace ($e + '\[[0-9;?]*[A-Za-z]'), '';
+    $one = ($p.Length + $line.Length) -lt [Console]::BufferWidth;
+    if ($one -and -not ($line + $p).Contains([string][char]10)) { try { [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt($null, [Console]::CursorTop) } catch { } }
   } } catch { };
   $e = $global:__bebo_e;
   try { Set-PSReadLineOption -Colors @{ Command = $e + '[34m'; Parameter = $e + '[33m'; Operator = $e + '[39m'; String = $e + '[32m'; Number = $e + '[33m'; Variable = $e + '[31m'; Keyword = $e + '[35m'; Member = $e + '[36m'; Type = $e + '[36m'; Comment = $e + '[90m'; Default = $e + '[39m' } } catch { }

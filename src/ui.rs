@@ -31,13 +31,22 @@ struct Ui<'a> {
 impl Ui<'_> {
     fn rect(&mut self, r: Rect, color: Rgb, alpha: u8, radius: f32) {
         let alpha = (alpha as u16 * (255 - self.fade) as u16 / 255) as u8;
-        let layer = if self.popup { &mut self.frame.popup } else { &mut self.frame.overlay };
+        let layer = match self.frame.popups.last_mut() {
+            Some(popup) if self.popup => &mut popup.0,
+            _ => &mut self.frame.overlay,
+        };
         layer.push(Quad { x: r.x, y: r.y + self.dy, w: r.w, h: r.h, color: [color[0], color[1], color[2], alpha], radius });
+    }
+
+    /// Starts a popup on a new layer above all earlier parts.
+    fn layer(&mut self) {
+        self.frame.popups.push(Default::default());
+        self.popup = true;
     }
 
     /// Starts a popup. While it opens, its parts fade in and move down.
     fn pop(&mut self, key: u32) {
-        self.popup = true;
+        self.layer();
         let progress = self.anim.to(key, 1.0, 0.02);
         self.fade = ((1.0 - progress) * 255.0) as u8;
         self.dy = ((progress - 1.0) * 8.0 * self.s).round();
@@ -65,7 +74,10 @@ impl Ui<'_> {
     fn spans(&mut self, x: f32, mid: f32, spans: Vec<Span>, font: Font, size: f32, align: Align) {
         let size = (size * self.s).round();
         let y = mid - (size * 1.4).ceil() / 2.0 + self.dy;
-        let layer = if self.popup { &mut self.frame.popup_rows } else { &mut self.frame.top_rows };
+        let layer = match self.frame.popups.last_mut() {
+            Some(popup) if self.popup => &mut popup.1,
+            _ => &mut self.frame.top_rows,
+        };
         layer.push(Row { x, y, clip: self.clip, spans, font, size, align, fade: self.fade, image: None });
     }
 
@@ -91,7 +103,10 @@ impl Ui<'_> {
         let id = if self.t.dark { id } else { id + 10 };
         let px = self.gpu.image_size(id, size * self.s);
         let row = Row { x: x.round(), y: (mid - px as f32 / 2.0).round() + self.dy, clip: self.clip, image: Some((id, px)), ..Default::default() };
-        let layer = if self.popup { &mut self.frame.popup_rows } else { &mut self.frame.top_rows };
+        let layer = match self.frame.popups.last_mut() {
+            Some(popup) if self.popup => &mut popup.1,
+            _ => &mut self.frame.top_rows,
+        };
         layer.push(row);
     }
 
@@ -119,8 +134,6 @@ impl App {
         anim.dt = if anim.active { (now - self.last_frame).as_secs_f32().min(0.05) } else { 1.0 / 60.0 };
         anim.active = false;
         anim.on = self.settings.animations;
-        // The caret needs about one third of the time between two typed characters: 60 ms for slow typing, 8 ms for a held key.
-        anim.caret_tau = (self.key_gap * 0.3).clamp(0.008, 0.06);
         anim.caret_live = self.last_input.elapsed() < Duration::from_millis(400);
         self.last_frame = now;
         // A closed popup opens from the start the next time.
@@ -325,7 +338,7 @@ impl App {
             if let Some((center, title)) = tip.filter(|_| !self.menu && self.palette.is_none()) {
                 let width = ui.width(&title, Font::Ui, 11.5) + 18.0 * s;
                 let r = Rect { x: (center - width / 2.0).clamp(4.0 * s, (ui.w - width - 4.0 * s).max(4.0 * s)), y: m.bar + 3.0 * s, w: width, h: 24.0 * s };
-                ui.popup = true;
+                ui.layer();
                 ui.panel(r, t.panel, 5.0 * s);
                 ui.text(r.x + r.w / 2.0, r.y + r.h / 2.0, &title, t.fg, Font::Ui, 11.5, Align::Center);
                 ui.popup = false;
@@ -424,7 +437,7 @@ impl App {
 
         let side = (185.0 * s).min(ui.w * 0.3);
         ui.rect(Rect { x: side, y: m.bar, w: 1.0, h: area.h }, line, 255, 0.0);
-        let pages = [("Appearance", Icon::Palette), ("Startup", Icon::Rocket), ("Keys", Icon::Keyboard)];
+        let pages = [("Appearance", Icon::Palette), ("Startup", Icon::Rocket), ("Shortcuts", Icon::Keyboard)];
         let page = self.settings_page.min(pages.len() - 1);
         for (i, (name, icon)) in pages.into_iter().enumerate() {
             let r = Rect { x: 7.0 * s, y: m.bar + 12.0 * s + i as f32 * 29.0 * s, w: side - 14.0 * s, h: 27.0 * s };
@@ -455,7 +468,7 @@ impl App {
                 row("Prompt position", "Top: after the output. Bottom: at the pane edge.", Choice(1, vec!["Top", "Bottom"], self.bottom as usize)),
                 row("Command popup", "Where the colon popup opens", Choice(2, vec!["Auto", "Always below", "Always above"], st.popup as usize)),
                 row("Font", "All installed fonts. Fixed-width fonts are first.", Select(3, ui.gpu.mono().to_string())),
-                row("Font size", "10 to 24 px", Step(4, format!("{}", st.font_px))),
+                row("Font size", "8 to 32 px. Ctrl+= and Ctrl+- also change it.", Step(4, format!("{}", st.font_px))),
                 row("Cursor", "Shape of the caret on the prompt", Choice(5, vec!["Beam", "Block", "Underline"], st.cursor as usize)),
                 row("Tab bar", "Auto: with one tab, the title bar shows the tab name", Choice(6, vec!["Auto", "Always", "Never"], st.tab_bar as usize)),
                 row("Minimap", "Marks for failed commands and find matches", Toggle(7, st.minimap)),
@@ -880,7 +893,10 @@ fn draw_pane(
     // At the prompt, bebo shows the cursor always. This prevents a flicker.
     let cursor_shown = term.mode().contains(TermMode::SHOW_CURSOR) || region.is_some();
     let cursor_visible = cursor_shown && (0..rows).contains(&cursor_row);
-    let cursor_px = (ox + cursor.column.0 as f32 * cw, oy + cursor_row as f32 * ch);
+    // After a character in the last column, the cursor stays in that column until the next character wraps the line.
+    // The caret then shows after that character, not on it.
+    let wrap = grid.cursor.input_needs_wrap as usize;
+    let cursor_px = (ox + (cursor.column.0 + wrap) as f32 * cw, oy + cursor_row as f32 * ch);
     // The prompt has a beam cursor. A full-screen program selects its own shape.
     let prompt_shape = [CursorShape::Beam, CursorShape::Block, CursorShape::Underline][settings.cursor.min(2) as usize];
     let shape = if alt { term.cursor_style().shape } else { prompt_shape };
@@ -905,6 +921,9 @@ fn draw_pane(
         let line = Line(top + row);
         let y = oy + row as f32 * ch;
         let mut spans: Vec<Span> = Vec::new();
+        // A fallback font has its own character width. Each wide character is a separate text row at its cell,
+        // so that the text after it stays on the cell grid. `seg_x` is the start of the current text row.
+        let mut seg_x = ox;
         for col in 0..cols {
             let cell = &grid[line][Column(col)];
             let flags = cell.flags;
@@ -944,6 +963,18 @@ fn draw_pane(
             }
             let c = if flags.contains(Flags::HIDDEN) || cell.c == '\t' { ' ' } else { cell.c };
             let (bold, italic) = (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC));
+            if flags.contains(Flags::WIDE_CHAR) {
+                if spans.iter().any(|s| !s.text.trim().is_empty()) {
+                    frame.rows.push(Row { x: seg_x, y, clip, spans: std::mem::take(&mut spans), ..Default::default() });
+                }
+                spans.clear();
+                let mut text = c.to_string();
+                text.extend(cell.zerowidth().into_iter().flatten());
+                let span = Span { text, color: fg, bold, italic };
+                frame.rows.push(Row { x, y, clip, spans: vec![span], ..Default::default() });
+                seg_x = x + w;
+                continue;
+            }
             match spans.last_mut() {
                 Some(span) if span.color == fg && span.bold == bold && span.italic == italic => span.text.push(c),
                 _ => spans.push(Span { text: c.to_string(), color: fg, bold, italic }),
@@ -961,7 +992,7 @@ fn draw_pane(
             spans.pop();
         }
         if !spans.is_empty() {
-            frame.rows.push(Row { x: ox, y, clip, spans, ..Default::default() });
+            frame.rows.push(Row { x: seg_x, y, clip, spans, ..Default::default() });
         }
     }
 
@@ -981,7 +1012,7 @@ fn draw_pane(
         let target = x + colon_text.as_ref().map_or(0.0, |text| text.chars().count() as f32 * cw);
         // The caret moves smoothly along its row. A different row is an immediate change.
         let (key_x, key_y) = (A_CARET + 2 * id as u32, A_CARET + 2 * id as u32 + 1);
-        let caret = if anim.caret_live && anim.values.get(&key_y) == Some(&y) { anim.to_in(key_x, target, 0.4, anim.caret_tau) } else { target };
+        let caret = if anim.caret_live && anim.values.get(&key_y) == Some(&y) { anim.to(key_x, target, 0.4) } else { target };
         anim.set(key_x, caret);
         anim.set(key_y, y);
         if let Some(text) = colon_text {
@@ -1000,9 +1031,11 @@ fn draw_pane(
                 },
             }
         }
-        // The current prompt has an accent bar at the left edge.
-        if region.is_some() && focused {
-            frame.overlay.push(quad(rect.x + 1.0, y, beam, ch, t.accent));
+        // The current prompt has an accent bar at the left edge, from its first row to the cursor row.
+        if let (Some(region), true) = (&region, focused) {
+            let first = (region.start.line.0 - top).clamp(0, cursor_row);
+            let bar_y = oy + first as f32 * ch;
+            frame.overlay.push(quad(rect.x + 1.0, bar_y, beam, y + ch - bar_y, t.accent));
         }
     }
 
@@ -1020,7 +1053,7 @@ fn draw_pane(
     if blocks_ok {
         for block in &pane.blocks {
             let row = block.line - history - top;
-            let failed = block.exit.is_some_and(|code| code != 0);
+            let failed = block.failed();
             if let (Some(duration), true) = (block.duration, (0..rows).contains(&row))
                 && (duration >= Duration::from_secs(1) || failed)
             {
@@ -1030,10 +1063,18 @@ fn draw_pane(
                     1..60 => format!("{:.1}s", duration.as_secs_f32()),
                     _ => format!("{}m{}s", secs / 60, secs % 60),
                 };
-                if let Some(code) = block.exit.filter(|code| *code != 0) {
+                if block.exit == Some(CTRL_C_EXIT) {
+                    label = format!("stopped  {label}").trim_end().to_string();
+                } else if let Some(code) = block.exit.filter(|_| failed) {
                     label = format!("exit {code}  {label}").trim_end().to_string();
                 }
-                let x = lane_x - m.pad - label.chars().count() as f32 * cw;
+                // The label shows only if it does not cover the text of its line.
+                let start = cols.saturating_sub(label.chars().count() + 1);
+                let line = Line(block.line - history);
+                if (start..cols).any(|col| grid[line][Column(col)].c != ' ') {
+                    continue;
+                }
+                let x = ox + (start + 1) as f32 * cw;
                 let color = if failed { t.red } else { t.dim };
                 frame.rows.push(mono(x, oy + row as f32 * ch, label, color));
             }
@@ -1053,7 +1094,7 @@ fn draw_pane(
     frame.quads.push(quad(lane_x + 1.0, lane_y(top).min(rect.y + rect.h - thumb_h).max(rect.y), m.lane - 1.0, thumb_h, thumb));
     let mark = (2.0 * s).max(1.0);
     if blocks_ok {
-        for block in pane.blocks.iter().filter(|b| b.exit.is_some_and(|code| code != 0)) {
+        for block in pane.blocks.iter().filter(|b| b.failed()) {
             frame.quads.push(quad(lane_x + 3.0 * s, lane_y(block.line - history), m.lane - 5.0 * s, mark, t.red));
         }
     }

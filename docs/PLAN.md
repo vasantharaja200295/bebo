@@ -471,7 +471,6 @@ Measured in bebo with 200,000 JSON lines (35 MB):
 - 24 frames during typing at 180 ms and at 40 ms for each character: the accent bar is in each frame, and the caret is at positions between the cells.
 - A frame 25 ms after the palette opens shows the palette during its fade.
 
-The caret speed follows the typing speed. Its time constant is 30 % of the smoothed time between two characters, from 8 ms to 60 ms.
 
 ### Not tested
 
@@ -517,3 +516,47 @@ Tested in the window: 45 frames at the start show the caret at column 0 and then
 - Limit: with more than about 30 tabs in a 1000 px window, the tabs go behind the window buttons.
 
 Tested in the window: 3 tabs and 25 tabs, the profile menu, the close button and the popover on a narrow tab, a double click rename, `:rename my server`, and the icon of the program file. Unit tests: 10 pass.
+
+## 14. Faster animations (2026-11-17)
+
+- All animations use one fixed time: the value goes 63 % of the distance in 18 ms and stops after about 70 ms. Before, popups used 45 ms and the caret followed the typing speed (8 ms to 60 ms). The typing speed has no effect now.
+- The settings page "Keys" has the name "Shortcuts" now.
+
+## 15. Resize faults (2026-11-17)
+
+| Fault | Cause | Fix |
+|---|---|---|
+| The PTY reader thread stopped with "index out of bounds", and then the pane showed no prompt and no cursor | After a resize that changed the width and the height, bebo moved scrollback lines with the old scrollback size. The cursor row became negative. | `resize_term` moves lines back to the scrollback only when the width does not change, and never more than the cursor row. Test: `resize_keeps_the_cursor_in_the_screen`. |
+| The prompt showed two times after a resize of a narrow window | The prompt redraw used the cursor row, but a long prompt and command use two or more rows. With a width change, ConPTY also draws the prompt itself. | bebo sends the redraw key only after a resize that kept the width. The script redraws only a prompt and a command that use one row. |
+
+- In a narrow pane, Windows PowerShell 5.1 breaks long names inside the Name column of `ls`. bebo gives PowerShell the correct width (tested: 60 columns). PowerShell 7 shortens the names with "…" instead.
+- Limit: after a resize that kept the width, a prompt and a command of two or more rows can show at a wrong row until the next prompt.
+
+## 16. Small display faults (2026-11-17)
+
+| Fault | Fix |
+|---|---|
+| The caret showed on the last character of a full row, one cell too far left | After a character in the last column, the cursor waits for the next character before it wraps. bebo now draws the caret after that character. |
+| The exit label covered the command text in a narrow pane | The label shows only if its cells on that row are empty. |
+| A stop with Ctrl+C showed as a red failure (`exit -1073741510`) | That exit code shows as a dim "stopped" label, with no red mark in the minimap. |
+| The prompt bar showed only on the cursor row of a command of two or more rows | The bar goes from the first row of the prompt to the cursor row. |
+
+Checked in the window: dark and light theme, split panes, profile menu, palette, find bar, settings tab, colon popup, restart, a full row of input, and exit labels.
+
+Known: after a restart, the new ConPTY clears the screen. The old content goes to the scrollback, so the screen is empty except for the banner and the prompt.
+
+## 17. Final test pass (2026-11-17)
+
+About 35 test runs with edge cases. No run stopped bebo: bad regex in find, find with no matches, palette with no matches, unknown colon command, a very small window, a 3000-character line, a full-screen program with a resize, `exit` in the last tab, `exit` with the settings tab open, split toggles, font size at the limits, paste of two lines, restart with a running command (Enter and Esc), rename, five tabs with a close in the middle, Command Prompt and WSL tabs, selection and copy, Ctrl+C on a running command.
+
+| Fault | Fix |
+|---|---|
+| Popups showed through each other: the text of the profile menu was on top of the palette | Each popup has its own drawing layer. The renderer draws the rectangles and the text of each layer before the next layer. The palette also closes the profile menu. |
+| Chinese, Japanese, and Korean characters showed as boxes | bebo loads Microsoft YaHei, Yu Gothic, Malgun Gothic, and Nirmala UI as fallback fonts. fontdb maps the files, so memory use stays low. |
+| Wide characters moved the text after them off the cell grid | Each wide character is a separate text row at its own cell. |
+| `[Console]::Write` and native programs gave `???` for characters outside the code page | The shell script sets the console output to UTF-8. |
+| `Ctrl+=` and `Ctrl+-` went past the limits of the settings page, and the value was not saved | One range, 8 to 32 px, for the keys and the settings page. The keys save the value. |
+| When the active tab closed, the tab on its left became active | The tab on its right becomes active, as in a web browser. |
+| A window could become too small for the title bar and the popups | The minimum window size is 420 x 240. |
+
+Not a bebo fault: a narrow pane with `ls` in Windows PowerShell 5.1 (section 15).

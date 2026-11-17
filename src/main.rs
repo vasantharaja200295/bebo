@@ -35,6 +35,9 @@ use render::Gpu;
 use theme::{Rgb, Theme};
 
 const FONT_PX: f32 = 13.0;
+/// The limits of the terminal font size in logical pixels, for the keys and for the settings page.
+const FONT_MIN: f32 = 8.0;
+const FONT_MAX: f32 = 32.0;
 
 #[derive(Clone, Copy)]
 struct Rect {
@@ -73,7 +76,8 @@ struct Pane {
     /// Message at the prompt after a restart.
     badge: Option<Badge>,
     /// After a resize, bebo asks PowerShell at this time to draw the prompt again.
-    prompt_fix: Option<Instant>,
+    /// The flag is `false` if a resize in this series changed the width. ConPTY then draws the prompt correctly.
+    prompt_fix: Option<(Instant, bool)>,
 }
 
 /// A prompt, its command, and the output of the command.
@@ -84,6 +88,16 @@ struct Block {
     exec_at: Option<Instant>,
     exit: Option<i32>,
     duration: Option<Duration>,
+}
+
+/// Exit code of a program that Ctrl+C stopped (STATUS_CONTROL_C_EXIT).
+const CTRL_C_EXIT: i32 = 0xC000013Au32 as i32;
+
+impl Block {
+    /// The command failed. A stop with Ctrl+C is not a failure.
+    fn failed(&self) -> bool {
+        self.exit.is_some_and(|code| code != 0 && code != CTRL_C_EXIT)
+    }
 }
 
 struct Badge {
@@ -475,8 +489,6 @@ struct Anim {
     on: bool,
     /// A value moved in this frame. `draw` then asks for the next frame.
     active: bool,
-    /// Time constant of the caret in seconds. `draw` calculates it from the typing speed.
-    caret_tau: f32,
     /// The user pressed a key a moment ago. Only then the caret moves smoothly: not at the start and not for shell output.
     caret_live: bool,
 }
@@ -484,17 +496,13 @@ struct Anim {
 impl Anim {
     /// Moves the value of `key` in the direction of `target` and returns it. The first call returns `target`.
     /// The value stops when it is nearer than `near` to the target.
+    /// The value goes 63 % of the distance in 18 ms, and stops after about 70 ms. The typing speed has no effect.
     fn to(&mut self, key: u32, target: f32, near: f32) -> f32 {
-        self.to_in(key, target, near, 0.045)
-    }
-
-    /// As `to`, with the time constant `tau` in seconds. The value goes 63 % of the distance in that time.
-    fn to_in(&mut self, key: u32, target: f32, near: f32, tau: f32) -> f32 {
         let value = self.values.entry(key).or_insert(target);
         if !self.on || (target - *value).abs() < near {
             *value = target;
         } else {
-            *value += (target - *value) * (1.0 - (-self.dt / tau).exp());
+            *value += (target - *value) * (1.0 - (-self.dt / 0.018).exp());
             self.active = true;
         }
         *value
@@ -571,7 +579,7 @@ impl Settings {
                 "position" => bottom = value == "bottom",
                 "popup" => s.popup = pick(&POPUPS, value, s.popup),
                 "font" => s.font = value.to_string(),
-                "font_size" => s.font_px = value.parse().unwrap_or(FONT_PX).clamp(10.0, 24.0),
+                "font_size" => s.font_px = value.parse().unwrap_or(FONT_PX).clamp(FONT_MIN, FONT_MAX),
                 "cursor" => s.cursor = pick(&CURSORS, value, s.cursor),
                 "tab_bar" => s.tab_bar = pick(&TAB_BARS, value, s.tab_bar),
                 "minimap" => s.minimap = value != "off",
@@ -671,9 +679,6 @@ struct App {
     last_frame: Instant,
     /// A shell has new output that is not on the screen.
     dirty: bool,
-    /// Time of the last typed character, and the smoothed time between characters in seconds.
-    last_key: Instant,
-    key_gap: f32,
     /// Time of the last key press of all types.
     last_input: Instant,
     /// The cell below the mouse: (pane, cell).
@@ -793,7 +798,8 @@ impl App {
             self.quit = true;
             return;
         }
-        if self.active >= index && self.active > 0 {
+        // A tab on the left moves the active tab one place. If the active tab closed, the tab on its right becomes active.
+        if self.active > index || self.active >= self.tabs.len() {
             self.active -= 1;
         }
         self.relayout();
@@ -966,29 +972,15 @@ impl App {
             let cols = (((rect.w - m.pad * 1.5 - m.lane) / m.cw) as usize).max(2);
             let rows = (((rect.h - m.pad) / m.ch) as usize).max(1);
             if (cols, rows) != (pane.cols, pane.rows) {
+                let same_width = cols == pane.cols && pane.prompt_fix.is_none_or(|(_, ok)| ok);
                 pane.cols = cols;
                 pane.rows = rows;
                 // A new width moves the lines, so the block lines are not correct after a resize.
                 pane.blocks.clear();
-                let mut term = pane.term.lock();
-                let old_rows = term.screen_lines();
-                let history = term.grid().history_size();
-                let full_screen = term.mode().contains(TermMode::ALT_SCREEN);
-                term.resize(TermSize { cols, rows });
-                // When the pane grows, alacritty_terminal moves scrollback lines down into the screen.
-                // ConPTY does not: it keeps the top line and draws its screen again, on top of those lines.
-                // Move the lines back to the scrollback, or the shell output erases them.
-                // ponytail: not done while a full-screen program runs, because the main grid is not accessible then.
-                let pulled = rows.saturating_sub(old_rows).min(history);
-                if pulled > 0 && !full_screen {
-                    let grid = term.grid_mut();
-                    grid.scroll_up(&(Line(0)..Line(rows as i32)), pulled);
-                    grid.cursor.point.line.0 -= pulled as i32;
-                }
-                drop(term);
+                resize_term(&mut pane.term.lock(), cols, rows);
                 let _ = pane.tx.send(Msg::Resize(Self::window_size(cols, rows, Some(gpu))));
                 // Wait until the resize stops. A window drag gives many sizes.
-                pane.prompt_fix = Some(Instant::now() + Duration::from_millis(150));
+                pane.prompt_fix = Some((Instant::now() + Duration::from_millis(150), same_width));
             }
         }
         if let (Some(window), Some(pane)) = (&self.window, self.focus_pane()) {
@@ -1530,11 +1522,15 @@ impl App {
         command.spawn().is_ok()
     }
 
+    /// `font_px` is in physical pixels.
     fn set_font(&mut self, font_px: f32) {
+        let font_px = (font_px / self.scale).round().clamp(FONT_MIN, FONT_MAX) * self.scale;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.set_font_px(font_px);
             self.settings.font_px = (gpu.font_px / self.scale).round();
         }
+        // Ctrl+= and Ctrl+- change the same setting as the settings page.
+        self.save_state();
         // Force a new size for each pane.
         for pane in self.panes.values_mut() {
             pane.cols = 0;
@@ -1615,7 +1611,10 @@ impl App {
         }
         match cmd {
             Cmd::NewTab => self.new_tab(None),
-            Cmd::RenameTab => self.palette = Some(Palette { rename: true, ..Default::default() }),
+            Cmd::RenameTab => {
+                self.menu = false;
+                self.palette = Some(Palette { rename: true, ..Default::default() });
+            },
             Cmd::NextTab => {
                 self.active = (self.active + 1) % self.tabs.len();
                 self.relayout();
@@ -1649,7 +1648,11 @@ impl App {
                 self.theme = self.settings.theme();
                 self.save_state();
             },
-            Cmd::Palette => self.palette = Some(Palette::default()),
+            // One popup at a time: the palette closes the profile menu.
+            Cmd::Palette => {
+                self.menu = false;
+                self.palette = Some(Palette::default());
+            },
             Cmd::Profile(profile) => self.new_tab(Some(profile)),
             Cmd::Admin(profile) => self.open_admin(profile),
             Cmd::Copy => self.copy(),
@@ -1980,13 +1983,6 @@ impl App {
         let plain = !ctrl && !alt;
         let is_text = plain && matches!(key, Key::Character(_) | Key::Named(NamedKey::Space));
         let is_delete = plain && matches!(key, Key::Named(NamedKey::Backspace | NamedKey::Delete));
-        if is_text || is_delete {
-            // The caret animation follows the typing speed. A pause counts as 0.4 s at most.
-            let now = Instant::now();
-            let gap = (now - self.last_key).as_secs_f32().min(0.4);
-            self.key_gap = self.key_gap * 0.6 + gap * 0.4;
-            self.last_key = now;
-        }
         let region = Region::new(pane, &term);
         let edit = if is_text || is_delete { region.as_ref().and_then(|r| r.delete_selection(&term)) } else { None };
         // Keep the command text for the restart confirm.
@@ -2124,7 +2120,7 @@ impl App {
                 return;
             },
             4 => {
-                let px = (self.settings.font_px + if value == 1 { 1.0 } else { -1.0 }).clamp(10.0, 24.0);
+                let px = self.settings.font_px + if value == 1 { 1.0 } else { -1.0 };
                 self.set_font(px * self.scale);
             },
             5 => self.settings.cursor = value.min(2),
@@ -2191,6 +2187,8 @@ impl ApplicationHandler<UserEvent> for App {
         let attributes = Window::default_attributes()
             .with_title("bebo")
             .with_inner_size(LogicalSize::new(1000.0, 610.0))
+            // Below this size, the title bar and the popups have no room.
+            .with_min_inner_size(LogicalSize::new(420.0, 240.0))
             .with_decorations(false)
             // A test window does not take the keyboard focus from the user.
             .with_active(std::env::var_os("BEBO_TEST").is_none())
@@ -2279,14 +2277,14 @@ impl ApplicationHandler<UserEvent> for App {
         let mut changed = false;
         for pane in self.panes.values_mut() {
             match pane.prompt_fix {
-                Some(time) if time <= now => {
+                Some((time, ok)) if time <= now => {
                     pane.prompt_fix = None;
                     // Ctrl+F12 runs the key handler of the bebo shell script. Only a PowerShell prompt gets the key.
-                    if pane.input_start.is_some() && matches!(pane.profile, Profile::Pwsh | Profile::PowerShell) {
+                    if ok && pane.input_start.is_some() && matches!(pane.profile, Profile::Pwsh | Profile::PowerShell) {
                         let _ = pane.tx.send(Msg::Input(Cow::Borrowed(b"[24;5~")));
                     }
                 },
-                Some(time) => next = Some(next.map_or(time, |n| n.min(time))),
+                Some((time, _)) => next = Some(next.map_or(time, |n| n.min(time))),
                 None => {},
             }
             match pane.badge.as_ref().and_then(|b| b.until) {
@@ -2312,6 +2310,27 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+}
+
+/// Changes the size of the grid. When the pane grows, alacritty_terminal moves scrollback lines down into the screen.
+/// ConPTY does not: it keeps the top line and draws its screen again, on top of those lines.
+/// This function moves the lines back to the scrollback, or the shell output erases them.
+/// When the width also changes, ConPTY moves lines into the screen as alacritty_terminal does. Then the lines stay.
+/// ponytail: not done while a full-screen program runs, because the main grid is not accessible then.
+fn resize_term<T: alacritty_terminal::event::EventListener>(term: &mut Term<T>, cols: usize, rows: usize) {
+    let old_rows = term.screen_lines();
+    let same_width = term.columns() == cols;
+    let full_screen = term.mode().contains(TermMode::ALT_SCREEN);
+    term.resize(TermSize { cols, rows });
+    let grid = term.grid_mut();
+    // The cursor row is the limit: a cursor above row 0 stops the PTY reader thread with an index error.
+    let pulled = rows.saturating_sub(old_rows).min(grid.cursor.point.line.0.max(0) as usize);
+    if pulled > 0 && same_width && !full_screen {
+        grid.scroll_up(&(Line(0)..Line(rows as i32)), pulled);
+        grid.cursor.point.line.0 -= pulled as i32;
+        let saved = &mut grid.saved_cursor.point.line.0;
+        *saved = (*saved - pulled as i32).max(0);
     }
 }
 
@@ -2556,8 +2575,6 @@ fn main() {
         anim: Anim::default(),
         last_frame: start,
         dirty: false,
-        last_key: start,
-        key_gap: 0.2,
         last_input: start,
         hover_cell: None,
         hover_link: None,
@@ -2641,7 +2658,7 @@ mod ui_tests {
     #[test]
     fn settings_text_reads_back_the_same() {
         let (mut settings, bottom) = Settings::parse("theme=light\nposition=bottom\ncursor=block\nfont_size=99\nbad line\n");
-        assert!(bottom && settings.theme == 1 && settings.cursor == 1 && settings.font_px == 24.0 && settings.minimap);
+        assert!(bottom && settings.theme == 1 && settings.cursor == 1 && settings.font_px == FONT_MAX && settings.minimap);
         settings.minimap = false;
         settings.profile = Some(Profile::Cmd);
         let (again, bottom) = Settings::parse(&settings.to_text(false));
@@ -2659,12 +2676,30 @@ mod ui_tests {
             anim.to(1, 10.0, 0.1);
         }
         assert_eq!(anim.to(1, 10.0, 0.1), 10.0);
-        // A shorter time constant moves the value farther in one frame.
-        anim.set(2, 0.0);
-        anim.set(3, 0.0);
-        assert!(anim.to_in(2, 10.0, 0.1, 0.01) > anim.to_in(3, 10.0, 0.1, 0.06));
         anim.on = false;
         assert_eq!(anim.to(1, 3.0, 0.1), 3.0);
+    }
+
+    #[test]
+    fn resize_keeps_the_cursor_in_the_screen() {
+        use alacritty_terminal::event::VoidListener;
+        // Long lines and a short screen: a narrow width moves many wrapped lines into the scrollback.
+        for (cols, rows) in [(20, 30), (10, 40), (80, 12), (5, 60), (40, 3), (120, 50), (60, 30)] {
+            let mut term = Term::new(Default::default(), &TermSize { cols: 60, rows: 5 }, VoidListener);
+            let mut parser: Processor<StdSyncHandler> = Processor::new();
+            for i in 0..40 {
+                parser.advance(&mut term, format!("line {i} {}
+", "x".repeat(50)).as_bytes());
+            }
+            parser.advance(&mut term, b"PS> ");
+            resize_term(&mut term, cols, rows);
+            let cursor = term.grid().cursor.point.line.0;
+            assert!((0..rows as i32).contains(&cursor), "cursor {cursor} for {cols}x{rows}");
+            // More output after the resize must not panic.
+            parser.advance(&mut term, b"echo
+ok
+8[5A[2K");
+        }
     }
 
     #[test]
