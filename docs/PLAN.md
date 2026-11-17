@@ -677,3 +677,18 @@ The profiler now counts the heap of bebo: a counting allocator adds and removes 
 - **Pane keys.** Alt+Left, Alt+Right, Alt+Up, and Alt+Down move the focus to the pane on that side. With one pane, the shell gets these keys. The command palette has the same commands ("Focus pane left" and the others).
 - **Prompt weight.** The prompt rows (the prompt line of each command and the command line now) are one weight step heavier than the output: 400 gives 500 (Medium). The request was +50, but a font file has only steps of 100, and the font search picks the lower weight for 450, so +50 gave no change in a pixel test. The Medium file of the default font loads at the start.
 - **Minimize.** Windows sends a resize to 160x28 when it minimizes the window. bebo gave that size to the shell, which then wrapped the prompt into a few columns; after the restore only the end of the prompt was left. bebo now ignores a resize while the window is minimized.
+
+## 23. Contrast (2026-11-17)
+
+Each text color of both themes now has a contrast of at least 4.5:1 (WCAG AA) on the background and on a selected row. The colors that failed moved toward white (dark theme) or black (light theme) until they had 4.6:1, so their hue stays. The test `text_colors_are_readable` in `src/theme.rs` checks it.
+
+| Theme | Color | Before | After |
+|---|---|---|---|
+| Dark | Secondary text (`dim`) | 3.5 | 4.6 |
+| Dark | Bright black (ANSI 8), grey text of many tools | 3.7 | 4.6 |
+| Dark | Red | 4.1 | 4.6 |
+| Dark | Text on a find match | 4.1 | 4.7 |
+| Light | Accent blue | 3.2 | 4.6 |
+| Light | Red, yellow, green, cyan, blue (ANSI) | 2.5 to 4.0 | 4.6 |
+
+Black and white (ANSI 0, 7, 15) do not change: programs also use them as background colors.
