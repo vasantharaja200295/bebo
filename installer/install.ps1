@@ -4,15 +4,18 @@
 # -Box shows the result in a message box. The setup .exe uses it, because its console is hidden.
 param([switch]$Box)
 $ErrorActionPreference = 'Stop'
-function Say([string]$text, [int]$icon) {
-    if ($Box) { (New-Object -ComObject WScript.Shell).Popup($text, 0, 'bebo setup', $icon) | Out-Null } else { Write-Host $text }
+# Returns the button that the user clicked (6 = Yes). Without -Box, the text goes to the console.
+function Say([string]$text, [int]$type) {
+    if ($Box) { (New-Object -ComObject WScript.Shell).Popup($text, 0, 'bebo setup', $type) } else { Write-Host $text }
 }
+# The console of the setup .exe is hidden, so an error must show in a message box.
+trap { Say "bebo could not be installed.`n`n$_" 16 | Out-Null; exit 1 }
 $source = Join-Path $PSScriptRoot 'bebo.exe'
 $dir = Join-Path $env:LOCALAPPDATA 'Programs\bebo'
 $exe = Join-Path $dir 'bebo.exe'
 
 if (Get-Process bebo -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe }) {
-    Say 'Close all bebo windows, then run the installer again.' 48
+    Say 'Close all bebo windows, then run the installer again.' 48 | Out-Null
     exit 1
 }
 
@@ -43,4 +46,7 @@ Set-ItemProperty -Path $key -Name NoModify -Value 1 -Type DWord
 Set-ItemProperty -Path $key -Name NoRepair -Value 1 -Type DWord
 Set-ItemProperty -Path $key -Name EstimatedSize -Value ([int]((Get-Item $exe).Length / 1KB)) -Type DWord
 
-Say "bebo is installed in $dir.`nOpen it from the Start menu. To remove it, use Settings > Apps > Installed apps." 64
+$text = "bebo is installed.`n`nOpen it from the Start menu: type bebo.`nTo remove it, use Settings > Apps > Installed apps."
+if (-not $Box) { Say $text 0 | Out-Null; exit }
+# 68 = Yes and No buttons with the information icon.
+if ((Say "$text`n`nOpen bebo now?" 68) -eq 6) { Start-Process $exe -WorkingDirectory $env:USERPROFILE }

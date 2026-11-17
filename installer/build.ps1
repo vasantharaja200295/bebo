@@ -44,7 +44,7 @@ AdminQuietInstCmd=%AdminQuietInstCmd%
 UserQuietInstCmd=%UserQuietInstCmd%
 SourceFiles=SourceFiles
 [Strings]
-InstallPrompt=
+InstallPrompt=Install bebo for the current user? Setup puts bebo in your AppData Programs folder, adds it to the Start menu, and adds it to Installed apps. Administrator rights are not necessary.
 DisplayLicense=
 FinishMessage=
 TargetName=$setup
@@ -66,6 +66,7 @@ SourceFiles0=$stage\
 # ponytail: IExpress does not accept quote marks around the SED path, so the project path must not contain spaces.
 Start-Process iexpress.exe -ArgumentList '/N', '/Q', $sed -Wait
 if (-not (Test-Path $setup)) { Pop-Location; throw 'IExpress did not make the setup .exe' }
+& (Join-Path $PSScriptRoot 'set-icon.ps1') -Exe $setup -Ico (Join-Path $root 'assets\app\bebo-dark.ico')
 Pop-Location
 Write-Host "Package: $setup"
 Write-Host "Package: $zip"
