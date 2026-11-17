@@ -595,18 +595,18 @@ Not changed, with the reason:
 
 ### Install package
 
-Run `installer\build.ps1`. It builds bebo and makes two packages:
+Run `installer\build.ps1`. It builds bebo and compiles `installer\bebo.iss` with Inno Setup 6 into `dist\bebo-<version>-setup.exe`.
+Inno Setup is necessary only on the build PC (`winget install JRSoftware.InnoSetup`). The setup wizard contains everything.
 
-- `dist\bebo-<version>-setup.exe`: double-click it to install. IExpress, which is part of Windows, makes it. The result shows in a message box.
-- `dist\bebo-<version>-x64.zip`: extract it and double-click `Install bebo.cmd`.
+The wizard:
+
+- installs `bebo.exe` to `%LOCALAPPDATA%\Programs\bebo` (no administrator rights). The user can select a different folder, or "all users" with administrator rights,
+- adds a Start menu shortcut, and a desktop shortcut if the user selects it,
+- adds bebo to "Installed apps" in Windows Settings, with the Inno Setup uninstaller,
+- asks the user to close bebo if it is open, and can open bebo on the last page.
 
 The setup .exe is not signed. If you download it from the internet, Windows SmartScreen shows a warning. A code signing certificate removes the warning.
-
-Both packages run the same install script. The installer:
-
-- copies `bebo.exe` to `%LOCALAPPDATA%\Programs\bebo` (no administrator rights),
-- adds a Start menu shortcut,
-- adds bebo to "Installed apps" in Windows Settings, with an uninstaller.
+An earlier version used IExpress and PowerShell scripts. They were replaced, because a script installer shows no pages and gives the user no clear result.
 
 bebo needs nothing more on the PC: the fonts, the icons, and the shell script are inside `bebo.exe`.
 

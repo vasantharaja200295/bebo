@@ -217,7 +217,7 @@ Test: idle CPU must be zero. A key must show on the screen in less than one fram
 ### Stage 13: Install
 
 1. Embed the icon in the program file with a build script.
-2. Write an install script for the current user: copy the program, add a Start menu shortcut, and add an entry in "Installed apps" so that Windows can uninstall it. No administrator rights.
+2. Make a setup wizard with Inno Setup (`installer\bebo.iss`) for the current user: copy the program, add a Start menu shortcut, and add an entry in "Installed apps" so that Windows can uninstall it. No administrator rights. Find out why the `AppId` must never change.
 3. Install on a clean user account. Check that the program needs nothing more.
 
 ## 4. How to debug a terminal
