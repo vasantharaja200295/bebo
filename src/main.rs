@@ -2315,6 +2315,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             // A minimized window has the size zero. Keep the layout, so that the shells keep their size.
             WindowEvent::Resized(size) if size.width == 0 || size.height == 0 => {},
+            // A minimized window gets a size of 160x28. The shell must keep its size, or it wraps the prompt
+            // into a few columns, and the restore does not bring the text back.
+            WindowEvent::Resized(_) if self.window.as_ref().and_then(|w| w.is_minimized()) == Some(true) => {},
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(size.width, size.height);
