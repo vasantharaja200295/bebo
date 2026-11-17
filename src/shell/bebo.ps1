@@ -1,6 +1,7 @@
 # bebo shell integration for PowerShell 5.1 and 7.
 # After a resize, PSReadLine has a wrong row for the prompt. bebo then sends Ctrl+F12, and the key handler draws the prompt again.
 # The handler does this only when the prompt and the command use one row. For two or more rows, the row of ConPTY and of bebo can be different by one.
+# The key handler and the colors cost about 60 ms. The first line read sets them up, after the prompt is on the screen.
 # bebo sends this file as one line. End each statement with ";". Do not use double quotes or comments in the code part.
 $global:__bebo_e = [string][char]27;
 $global:__bebo_b = [string][char]7;
@@ -22,10 +23,12 @@ function global:restart { [Console]::Write($global:__bebo_e + ']7717;restart' + 
 Import-Module PSReadLine -ErrorAction SilentlyContinue;
 if (Get-Module PSReadLine) {
   function global:PSConsoleHostReadLine {
+    if (-not $global:__bebo_ready) { $global:__bebo_ready = $true; __bebo_setup };
     $line = [Microsoft.PowerShell.PSConsoleReadLine]::ReadLine($Host.Runspace, $ExecutionContext);
     if ($line.Trim()) { [Console]::Write($global:__bebo_e + ']133;C' + $global:__bebo_b) };
     $line
   };
+  function global:__bebo_setup {
   try { Set-PSReadLineKeyHandler -Chord 'Ctrl+F12' -ScriptBlock {
     $line = $null;
     $cursor = $null;
@@ -39,6 +42,7 @@ if (Get-Module PSReadLine) {
   } } catch { };
   $e = $global:__bebo_e;
   try { Set-PSReadLineOption -Colors @{ Command = $e + '[34m'; Parameter = $e + '[33m'; Operator = $e + '[39m'; String = $e + '[32m'; Number = $e + '[33m'; Variable = $e + '[31m'; Keyword = $e + '[35m'; Member = $e + '[36m'; Type = $e + '[36m'; Comment = $e + '[90m'; Default = $e + '[39m' } } catch { }
+  };
 };
 if ($env:BEBO_BANNER) {
   $parts = $env:BEBO_BANNER.Split('|');

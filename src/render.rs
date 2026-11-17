@@ -178,6 +178,9 @@ pub struct Gpu {
     mono: String,
     /// All installed font families: (name, fixed width). Empty until `families` reads the system fonts.
     families: Vec<(String, bool)>,
+    /// The file of the font list (see `set_font_cache`), and the fonts that were loaded from it.
+    font_cache: Option<std::path::PathBuf>,
+    cached: std::collections::HashSet<String>,
     ui: String,
     /// Weight of the terminal font, 100 to 900. Bold text is 300 heavier.
     weight: u16,
@@ -197,7 +200,7 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn new(window: Arc<Window>, parts: Device, font_px: f32, t0: std::time::Instant) -> Self {
+    pub fn new(window: Arc<Window>, parts: Device, fonts: Fonts, font_px: f32, t0: std::time::Instant) -> Self {
         let Device { instance, adapter, device, queue } = parts;
         let size = window.inner_size();
         let surface = instance.create_surface(window.clone()).expect("create surface");
@@ -262,40 +265,11 @@ impl Gpu {
         let vertex_capacity = 256 * 1024;
         let vertices = Self::vertex_buffer(&device, vertex_capacity);
 
-        let mut db = fontdb::Database::new();
-        if cfg!(windows) {
-            // Windows: load only the fonts that bebo uses. A scan of all system fonts is slow.
-            let user_fonts = std::env::var("LOCALAPPDATA").unwrap_or_default() + r"\Microsoft\Windows\Fonts\";
-            // Medium is for the prompt rows, which are 50 heavier than regular.
-            for file in ["JetBrainsMonoNL-Regular.ttf", "JetBrainsMonoNL-Medium.ttf", "JetBrainsMonoNL-Bold.ttf", "JetBrainsMonoNL-Italic.ttf"] {
-                if db.load_font_file(format!("{user_fonts}{file}")).is_err() {
-                    let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
-                }
-            }
-            let system = [
-                "CascadiaMono.ttf", "consola.ttf", "consolab.ttf", "segoeui.ttf", "seguisb.ttf", "seguisym.ttf",
-                "seguiemj.ttf",
-                // Fallback fonts for Chinese, Japanese, Korean, and Indian scripts. fontdb maps the files and reads only the parts in use.
-                "msyh.ttc", "YuGothR.ttc", "malgun.ttf", "Nirmala.ttc",
-            ];
-            for file in system {
-                let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
-            }
-        } else {
-            // macOS: the fonts of the system are in many files, and the fallback fonts (emoji, CJK, symbols) are among them.
-            // ponytail: this reads all system fonts at the start. Load a short list, as on Windows, if the start is slow.
-            db.load_system_fonts();
-        }
-        db.load_font_source(fontdb::Source::Binary(Arc::new(lucide_icons::LUCIDE_FONT_BYTES)));
-        // Geist is the interface font. The two weights are inside bebo.exe (Open Font License, see assets/fonts/OFL.txt).
-        // Segoe UI gives the characters that Geist does not have.
-        db.load_font_source(fontdb::Source::Binary(Arc::new(include_bytes!("../assets/fonts/Geist-Regular.ttf"))));
-        db.load_font_source(fontdb::Source::Binary(Arc::new(include_bytes!("../assets/fonts/Geist-SemiBold.ttf"))));
-        let has = |name: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
+        let Fonts { system: font_system, from_list } = fonts;
+        let has = |name: &str| font_system.db().faces().any(|f| f.families.iter().any(|(n, _)| n == name));
         let fallback = if cfg!(target_os = "macos") { "Menlo" } else { "Consolas" };
         let mono = ["JetBrains Mono NL", "Cascadia Mono", "SF Mono", "Menlo", "Consolas"].into_iter().find(|n| has(n)).unwrap_or(fallback).to_string();
         let ui = "Geist".to_string();
-        let font_system = FontSystem::new_with_locale_and_db("en-US".into(), db);
         tick(t0, "fonts");
 
         let cache = Cache::new(&device);
@@ -321,6 +295,8 @@ impl Gpu {
             text,
             mono,
             families: Vec::new(),
+            font_cache: None,
+            cached: from_list.into_iter().collect(),
             ui,
             weight: 400,
             images: HashMap::new(),
@@ -383,18 +359,64 @@ impl Gpu {
             list.sort_by_key(|(n, fixed)| (!fixed, n.to_lowercase()));
             list.dedup_by(|a, b| a.0 == b.0);
             self.families = list;
+            self.write_font_cache();
         }
         &self.families
+    }
+
+    /// The file of the font list: each line is "family<TAB>file". bebo writes it after a full scan of the system fonts,
+    /// so that the next start loads only the files of the fonts in use.
+    pub fn set_font_cache(&mut self, path: Option<std::path::PathBuf>) {
+        self.font_cache = path;
+    }
+
+    fn write_font_cache(&self) {
+        let Some(path) = &self.font_cache else { return };
+        let mut lines: Vec<String> = Vec::new();
+        for face in self.font_system.db().faces() {
+            let file = match &face.source {
+                fontdb::Source::File(p) => p,
+                fontdb::Source::SharedFile(p, _) => p,
+                fontdb::Source::Binary(_) => continue,
+            };
+            for (name, _) in &face.families {
+                lines.push(format!("{name}\t{}", file.display()));
+            }
+        }
+        lines.sort();
+        lines.dedup();
+        let _ = std::fs::write(path, lines.join("\n"));
+    }
+
+    /// Loads all files (all weights and styles) of font `name` from the font list.
+    /// Returns false if the list does not have the font; the caller then reads all system fonts.
+    fn load_family(&mut self, name: &str) -> bool {
+        if !self.families.is_empty() || self.cached.contains(name) {
+            return true;
+        }
+        let Some(text) = self.font_cache.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) else { return false };
+        let files: Vec<&str> = text.lines().filter_map(|l| l.split_once('\t')).filter(|(n, _)| *n == name).map(|(_, f)| f).collect();
+        if files.is_empty() {
+            return false;
+        }
+        let db = self.font_system.db_mut();
+        // A file that is gone (an uninstalled font) gives an error. `installed` then finds no font and reads all system fonts.
+        let ok = files.iter().filter(|f| db.load_font_file(f).is_ok()).count() == files.len();
+        if ok {
+            self.cached.insert(name.to_string());
+        }
+        ok
     }
 
     pub fn ui(&self) -> &str {
         &self.ui
     }
 
-    /// True if font `name` is installed. The first unknown name reads the system font folders.
+    /// True if font `name` is installed. A name that is not loaded comes from the font list.
+    /// Only a name that the list does not have reads the system font folders.
     fn installed(&mut self, name: &str) -> bool {
         let has = |db: &fontdb::Database| db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
-        if !has(self.font_system.db()) {
+        if !has(self.font_system.db()) && !(self.load_family(name) && has(self.font_system.db())) {
             self.families();
         }
         has(self.font_system.db())
@@ -417,12 +439,13 @@ impl Gpu {
         }
     }
 
-    /// Sets the weight of the terminal font. Only the regular and bold files load at the start,
-    /// so another weight reads the system font folders. A font without that weight uses its nearest weight.
+    /// Sets the weight of the terminal font. The other weights of the font come from the font list,
+    /// or from the system font folders if the list does not have the font. A font without that weight uses its nearest weight.
     pub fn set_weight(&mut self, weight: u16) {
         let weight = weight.clamp(100, 900) / 100 * 100;
         if weight != self.weight {
-            if weight != 400 {
+            let mono = self.mono.clone();
+            if weight != 400 && !self.load_family(&mono) {
                 self.families();
             }
             self.weight = weight;
@@ -753,6 +776,73 @@ pub mod prof {
 
 /// Start-up timing log. `main` writes it to a file if BEBO_TIMING is set.
 pub static TIMING: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// The fonts for the renderer, made on a second thread while the GPU starts. File reads do not need the GPU.
+pub struct Fonts {
+    system: FontSystem,
+    /// The fonts that came from the font list, with all their files.
+    from_list: Vec<String>,
+}
+
+/// Loads the fonts that bebo uses at the start, and the fonts in `wanted` from the font list (see `Gpu::set_font_cache`).
+/// `wanted` is the terminal font and the interface font (empty: the default font). For a terminal font `weight` that is not 400,
+/// the other weights of the terminal font load also. A font that the list does not have stays for `Gpu::installed`,
+/// which then reads all system fonts.
+pub fn load_fonts(wanted: &[String], weight: u16, list: Option<std::path::PathBuf>) -> Fonts {
+    let all_weights = weight != 400;
+    let mut db = fontdb::Database::new();
+    if cfg!(windows) {
+        // Windows: load only the fonts that bebo uses. A scan of all system fonts is slow.
+        let user_fonts = std::env::var("LOCALAPPDATA").unwrap_or_default() + r"\Microsoft\Windows\Fonts\";
+        // Medium is for the prompt rows, which are 50 heavier than regular.
+        for file in ["JetBrainsMonoNL-Regular.ttf", "JetBrainsMonoNL-Medium.ttf", "JetBrainsMonoNL-Bold.ttf", "JetBrainsMonoNL-Italic.ttf"] {
+            if db.load_font_file(format!("{user_fonts}{file}")).is_err() {
+                let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
+            }
+        }
+        let system = [
+            "CascadiaMono.ttf", "consola.ttf", "consolab.ttf", "segoeui.ttf", "seguisb.ttf", "seguisym.ttf",
+            "seguiemj.ttf",
+            // Fallback fonts for Chinese, Japanese, Korean, and Indian scripts. fontdb maps the files and reads only the parts in use.
+            "msyh.ttc", "YuGothR.ttc", "malgun.ttf", "Nirmala.ttc",
+        ];
+        for file in system {
+            let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
+        }
+    } else {
+        // macOS: the fonts of the system are in many files, and the fallback fonts (emoji, CJK, symbols) are among them.
+        // ponytail: this reads all system fonts at the start. Load a short list, as on Windows, if the start is slow.
+        db.load_system_fonts();
+    }
+    db.load_font_source(fontdb::Source::Binary(Arc::new(lucide_icons::LUCIDE_FONT_BYTES)));
+    // Geist is the interface font. The two weights are inside bebo.exe (Open Font License, see assets/fonts/OFL.txt).
+    // Segoe UI gives the characters that Geist does not have.
+    db.load_font_source(fontdb::Source::Binary(Arc::new(include_bytes!("../assets/fonts/Geist-Regular.ttf"))));
+    db.load_font_source(fontdb::Source::Binary(Arc::new(include_bytes!("../assets/fonts/Geist-SemiBold.ttf"))));
+    let text = list.and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let mut from_list = Vec::new();
+    for name in wanted.iter().filter(|n| !n.is_empty()) {
+        let loaded = db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
+        if loaded && !all_weights {
+            continue;
+        }
+        let files: Vec<&str> = text.lines().filter_map(|l| l.split_once('\t')).filter(|(n, _)| n == name).map(|(_, f)| f).collect();
+        if !files.is_empty() && files.iter().all(|f| db.load_font_file(f).is_ok()) {
+            from_list.push(name.clone());
+        }
+    }
+    let mut system = FontSystem::new_with_locale_and_db("en-US".into(), db);
+    // The first text in a font reads and parses the font file (about 15 ms for each font). Do it here, not in the first frame.
+    let mono = wanted.first().filter(|n| !n.is_empty()).map_or("JetBrains Mono NL", |n| n.as_str());
+    let ui = wanted.get(1).filter(|n| !n.is_empty()).map_or("Geist", |n| n.as_str());
+    let prompt = (weight + 50).div_ceil(100) * 100;
+    for (family, w) in [(mono, weight), (mono, prompt), (mono, (weight + 300).min(900)), (ui, 400), (ui, 600)] {
+        let mut probe = Buffer::new(&mut system, Metrics::new(14.0, 18.0));
+        probe.set_text("M", &Attrs::new().family(Family::Name(family)).weight(Weight(w)), Shaping::Advanced, None);
+        probe.shape_until_scroll(&mut system, false);
+    }
+    Fonts { system, from_list }
+}
 
 pub fn tick(start: std::time::Instant, label: &str) {
     TIMING.lock().unwrap().push_str(&format!("{:>5} ms  {label}\n", start.elapsed().as_millis()));

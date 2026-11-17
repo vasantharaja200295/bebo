@@ -476,6 +476,8 @@ macro_rules! add_icon {
 
 /// Number of rows in the font list of the settings page.
 const FONT_ROWS: usize = 10;
+/// The size in cells of the first shell before the first layout. The layout then sets the size of the window.
+const FIRST_SIZE: (usize, usize) = (100, 30);
 
 // Keys of the animation values.
 const A_PALETTE: u32 = 1;
@@ -652,6 +654,12 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     gpu_rx: std::sync::mpsc::Receiver<render::Device>,
+    /// The GPU thread starts in `resumed`, after the window and the shell. It sends the device on this channel.
+    gpu_tx: Option<std::sync::mpsc::Sender<render::Device>>,
+    /// The shell of the first tab (pane id 0). It starts on a second thread in `main`, and `resumed` adds its tab.
+    first_tab: Option<(Profile, std::thread::JoinHandle<(SharedTerm, EventLoopSender)>)>,
+    /// The thread that loads the fonts. `start_gpu` waits for it.
+    fonts: Option<std::thread::JoinHandle<render::Fonts>>,
     panes: HashMap<usize, Pane>,
     tabs: Vec<Tab>,
     active: usize,
@@ -762,6 +770,13 @@ impl App {
         let term = pty::new_term(proxy.clone(), cols, rows);
         let size = Self::window_size(cols, rows, self.gpu.as_ref());
         let tx = pty::spawn_shell(term.clone(), proxy, size, cwd.clone(), profile, None).expect("cannot start the shell");
+        self.add_pane(id, term, tx, cwd, profile, (cols, rows));
+        id
+    }
+
+    /// Adds a pane for a shell that runs already.
+    fn add_pane(&mut self, id: usize, term: SharedTerm, tx: EventLoopSender, cwd: Option<PathBuf>, profile: Profile, size: (usize, usize)) {
+        let (cols, rows) = size;
         let pane = Pane {
             term,
             tx,
@@ -780,7 +795,6 @@ impl App {
             prompt_fix: None,
         };
         self.panes.insert(id, pane);
-        id
     }
 
     fn focus_pane(&self) -> Option<&Pane> {
@@ -943,7 +957,9 @@ impl App {
         }
         let Ok(parts) = self.gpu_rx.try_recv() else { return };
         self.scale = window.scale_factor() as f32;
-        let mut gpu = Gpu::new(window, parts, self.settings.font_px * self.scale, self.start);
+        let fonts = self.fonts.take().map(|t| t.join().expect("font thread")).unwrap_or_else(|| render::load_fonts(&[], 400, None));
+        let mut gpu = Gpu::new(window, parts, fonts, self.settings.font_px * self.scale, self.start);
+        gpu.set_font_cache(config_dir().map(|d| d.join("fonts.txt")));
         gpu.set_mono(&self.settings.font);
         gpu.set_ui(&self.settings.ui_font);
         gpu.set_weight(self.settings.font_weight);
@@ -2345,6 +2361,26 @@ impl App {
         }
     }
 
+    /// The GDI frame before the GPU frame: the title bar with the name of the first tab.
+    fn paint_first_frame(&self) {
+        let Some(window) = &self.window else { return };
+        let t = self.theme;
+        let profile = self.first_tab.as_ref().map(|(p, _)| *p).or(self.focus_pane().map(|p| p.profile)).unwrap_or_else(Profile::default_profile);
+        // The title bar shows the tab name if it shows no tabs (see `draw_titlebar`).
+        let title = if self.settings.tab_bar == 1 { "" } else { profile.label() };
+        let frame = platform::FirstFrame {
+            bg: t.bg,
+            bar: t.bar,
+            line: theme::mix(t.bar, t.border, 0.5),
+            fg: t.fg,
+            dim: t.dim,
+            title_color: theme::mix(t.fg, t.dim, 0.4),
+            scale: window.scale_factor() as f32,
+            title,
+        };
+        platform::paint_first_frame(window, &frame);
+    }
+
     /// Writes the settings to a file. bebo reads the file at the next start.
     fn save_state(&self) {
         let Some(dir) = config_dir() else { return };
@@ -2377,10 +2413,25 @@ impl ApplicationHandler<UserEvent> for App {
             attributes.with_titlebar_transparent(true).with_fullsize_content_view(true).with_title_hidden(true)
         };
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
-        // The window shows immediately with the background color. The GPU frame comes when the device is ready.
-        platform::paint_background(&window, self.theme.bg);
         self.window = Some(window);
+        // The window shows at once with a GDI frame. The GPU frame comes when the device is ready.
+        self.paint_first_frame();
         render::tick(self.start, "window");
+        // Then the shell, which is the slowest part of the start. Then the GPU thread: it loads the large OpenGL driver,
+        // and Windows loads only one DLL at a time, so the window and the shell go first.
+        if let Some((profile, shell)) = self.first_tab.take() {
+            let (term, tx) = shell.join().expect("cannot start the shell");
+            self.add_pane(0, term, tx, None, profile, FIRST_SIZE);
+            self.tabs.push(Tab { id: 0, root: Node::Leaf(0), focus: 0, name: None, settings: false });
+            self.relayout();
+        }
+        if let Some(gpu_tx) = self.gpu_tx.take() {
+            let (proxy, start) = (self.proxy.clone(), self.start);
+            std::thread::spawn(move || {
+                let _ = gpu_tx.send(render::init_device(start));
+                let _ = proxy.send_event(UserEvent::GpuReady);
+            });
+        }
         self.start_gpu();
     }
 
@@ -2414,9 +2465,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.set_font(self.settings.font_px * self.scale);
             },
             WindowEvent::RedrawRequested if self.gpu.is_none() => {
-                if let Some(window) = &self.window {
-                    platform::paint_background(window, self.theme.bg);
-                }
+                self.paint_first_frame();
             },
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
@@ -2737,15 +2786,13 @@ fn main() {
     render::prof::init();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    // Start the GPU on a second thread now. It is the slowest step of the start.
     let (gpu_tx, gpu_rx) = std::sync::mpsc::channel();
-    let gpu_proxy = event_loop.create_proxy();
-    std::thread::spawn(move || {
-        let _ = gpu_tx.send(render::init_device(start));
-        let _ = gpu_proxy.send_event(UserEvent::GpuReady);
-    });
     let state = config_dir().and_then(|d| std::fs::read_to_string(d.join("settings.txt")).ok()).unwrap_or_default();
     let (settings, bottom) = Settings::parse(&state);
+    // The fonts load on a second thread while the shell and the GPU start.
+    let wanted = vec![settings.font.clone(), settings.ui_font.clone()];
+    let (weight, list) = (settings.font_weight, config_dir().map(|d| d.join("fonts.txt")));
+    let fonts = std::thread::spawn(move || render::load_fonts(&wanted, weight, list));
     let profiles = Profile::available();
     // `--profile` and `--cwd` come from "Open as administrator".
     let args: Vec<String> = std::env::args().collect();
@@ -2758,6 +2805,17 @@ fn main() {
         // The first shell starts in the folder of the process.
         let _ = std::env::set_current_dir(PathBuf::from(folder).components().collect::<PathBuf>());
     }
+    // The first shell is the slowest part of the start. It starts at once on a second thread, while the window opens.
+    let first = first_profile.unwrap_or_else(Profile::default_profile);
+    let shell_proxy = event_loop.create_proxy();
+    let first_shell = std::thread::spawn(move || {
+        let proxy = Proxy { id: 0, generation: 0, proxy: shell_proxy };
+        let (cols, rows) = FIRST_SIZE;
+        let term = pty::new_term(proxy.clone(), cols, rows);
+        let tx = pty::spawn_shell(term.clone(), proxy, App::window_size(cols, rows, None), None, first, None).expect("cannot start the shell");
+        render::tick(start, "shell spawned");
+        (term, tx)
+    });
     let mut app = App {
         proxy: event_loop.create_proxy(),
         start,
@@ -2767,7 +2825,8 @@ fn main() {
         panes: HashMap::new(),
         tabs: Vec::new(),
         active: 0,
-        next_id: 0,
+        // Pane 0 is the first shell, see `first_tab`.
+        next_id: 1,
         pane_rects: Vec::new(),
         dividers: Vec::new(),
         mods: ModifiersState::empty(),
@@ -2806,17 +2865,20 @@ fn main() {
         last_input: start,
         hover_cell: None,
         hover_link: None,
-        // The program file has two icons: 1 for the dark mode of Windows and 2 for the light mode. See build.rs.
-        #[cfg(windows)]
-        icon: Icon::from_resource(if platform::system_dark() { 1 } else { 2 }, None).ok(),
-        #[cfg(not(windows))]
         icon: None,
-        admin: platform::is_admin(),
+        admin: false,
+        fonts: Some(fonts),
+        gpu_tx: Some(gpu_tx),
+        first_tab: Some((first, first_shell)),
     };
+    // The window needs the icon. No other thread loads DLLs yet, so this takes about 1 ms.
+    // The program file has two icons: 1 for the dark mode of Windows and 2 for the light mode. See build.rs.
+    #[cfg(windows)]
+    {
+        app.icon = Icon::from_resource(if platform::system_dark() { 1 } else { 2 }, None).ok();
+    }
+    app.admin = platform::is_admin();
     render::tick(start, "event loop");
-    // Start the shell before the window and the GPU. The shell starts while the GPU starts.
-    app.new_tab(first_profile);
-    render::tick(start, "shell spawned");
     event_loop.run_app(&mut app).expect("run");
 }
 

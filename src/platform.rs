@@ -88,43 +88,173 @@ pub fn system_dark() -> bool {
 }
 
 /// True if bebo runs as administrator (Windows) or as root.
+/// Windows: the elevation of the process token. `IsUserAnAdmin` gives the same answer, but it loads shell32.dll (about 10 ms).
 pub fn is_admin() -> bool {
-    // SAFETY: both functions have no arguments and only read the token or the user id of this process.
     #[cfg(windows)]
+    // SAFETY: the token handle is closed here, and TOKEN_ELEVATION is plain data of the size that the call gets.
     unsafe {
-        windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut size = 0u32;
+        let size_of = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
+        let ok = GetTokenInformation(token, TokenElevation, (&mut elevation as *mut TOKEN_ELEVATION).cast(), size_of, &mut size);
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
     }
     #[cfg(unix)]
+    // SAFETY: the function has no arguments and only reads the user id of this process.
     unsafe {
         libc::geteuid() == 0
     }
 }
 
-/// Fills the window with the background color through GDI. bebo uses this before the GPU is ready.
-/// On macOS, the window has a background color of its own.
+/// What the first frame shows before the GPU is ready. macOS has no such frame.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct FirstFrame<'a> {
+    pub bg: Rgb,
+    pub bar: Rgb,
+    pub line: Rgb,
+    pub fg: Rgb,
+    pub dim: Rgb,
+    pub title_color: Rgb,
+    /// The display scale.
+    pub scale: f32,
+    /// The name of the tab in the title bar, or empty if the title bar shows tabs.
+    pub title: &'a str,
+}
+
+/// Draws the first frame with GDI, about 2 ms after the window opens: the background, the title bar, the icon, the name,
+/// the tab name, and the window buttons, at the same places as the GPU frame. The GPU frame replaces it about 250 ms later.
+/// The terminal text comes only with the GPU frame.
 #[cfg(windows)]
-pub fn paint_background(window: &Window, color: Rgb) {
-    use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, GetDC, ReleaseDC};
+pub fn paint_first_frame(window: &Window, f: &FirstFrame) {
+    use windows_sys::Win32::Foundation::{POINT, RECT, SIZE};
+    use windows_sys::Win32::Graphics::Gdi::*;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DI_NORMAL, DestroyIcon, DrawIconEx, IMAGE_ICON, LoadImageW};
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+    static FONTS: std::sync::Once = std::sync::Once::new();
     let Ok(handle) = window.window_handle() else { return };
     let RawWindowHandle::Win32(handle) = handle.as_raw() else { return };
     let hwnd = handle.hwnd.get() as *mut core::ffi::c_void;
     let size = window.inner_size();
-    let rect = RECT { left: 0, top: 0, right: size.width as i32, bottom: size.height as i32 };
-    // SAFETY: `hwnd` is the handle of a window that is alive. The DC and the brush are released here.
+    let (w, h) = (size.width as i32, size.height as i32);
+    let s = f.scale;
+    let px = |v: f32| (v * s).round() as i32;
+    let color = |c: Rgb| c[0] as u32 | (c[1] as u32) << 8 | (c[2] as u32) << 16;
+    let wide = |t: &str| t.encode_utf16().collect::<Vec<u16>>();
+    let bar = px(30.0);
+    let mid = bar / 2;
+    // SAFETY: `hwnd` is the handle of a window that is alive. Each GDI object is selected out and deleted here,
+    // and the DC is released. The font data lives in the program file for the life of the process.
     unsafe {
+        // The interface font Geist is inside bebo. GDI gets it once, for this process only.
+        FONTS.call_once(|| {
+            for data in [&include_bytes!("../assets/fonts/Geist-Regular.ttf")[..], &include_bytes!("../assets/fonts/Geist-SemiBold.ttf")[..]] {
+                let count = 0u32;
+                AddFontMemResourceEx(data.as_ptr().cast(), data.len() as u32, std::ptr::null(), &count);
+            }
+        });
         let dc = GetDC(hwnd);
-        let brush = CreateSolidBrush(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
-        FillRect(dc, &rect, brush);
-        DeleteObject(brush);
+        let fill = |r: RECT, c: Rgb| {
+            let brush = CreateSolidBrush(color(c));
+            FillRect(dc, &r, brush);
+            DeleteObject(brush);
+        };
+        fill(RECT { left: 0, top: 0, right: w, bottom: h }, f.bg);
+        fill(RECT { left: 0, top: 0, right: w, bottom: bar }, f.bar);
+        fill(RECT { left: 0, top: bar - 1, right: w, bottom: bar }, f.line);
+
+        // The icon of the program file: 1 is for dark mode, 2 for light mode (see build.rs). The color of the bar tells which.
+        let dark = f.bar.iter().map(|c| *c as u32).sum::<u32>() < 384;
+        let icon_size = px(16.0);
+        let icon = LoadImageW(GetModuleHandleW(std::ptr::null()), if dark { 1 } else { 2 } as usize as *const u16, IMAGE_ICON, icon_size, icon_size, 0);
+        if !icon.is_null() {
+            DrawIconEx(dc, px(10.0) - px(1.0), mid - icon_size / 2, icon, icon_size, icon_size, 0, std::ptr::null_mut(), DI_NORMAL);
+            DestroyIcon(icon);
+        }
+
+        SetBkMode(dc, TRANSPARENT as i32);
+        let font = |weight: i32| {
+            let face = wide("Geist\0");
+            let mut lf: LOGFONTW = std::mem::zeroed();
+            lf.lfHeight = -px(12.0);
+            lf.lfWeight = weight;
+            lf.lfQuality = CLEARTYPE_QUALITY;
+            lf.lfFaceName[..face.len()].copy_from_slice(&face);
+            CreateFontIndirectW(&lf)
+        };
+        // Text with its left side at `x` and its middle at the middle of the bar. Returns the width.
+        let text = |x: i32, t: &str, c: Rgb, weight: i32| -> i32 {
+            let font = font(weight);
+            let old = SelectObject(dc, font);
+            SetTextColor(dc, color(c));
+            let t = wide(t);
+            let mut extent = SIZE { cx: 0, cy: 0 };
+            GetTextExtentPoint32W(dc, t.as_ptr(), t.len() as i32, &mut extent);
+            TextOutW(dc, x, mid - extent.cy / 2, t.as_ptr(), t.len() as i32);
+            SelectObject(dc, old);
+            DeleteObject(font);
+            extent.cx
+        };
+        let mut x = px(31.0);
+        x += text(x, "bebo", f.fg, 600) + px(10.0);
+        if !f.title.is_empty() {
+            text(x, "/", f.dim, 400);
+            // The icon of the shell comes with the GPU frame.
+            x += px(14.0);
+            x += px(27.0) + text(x + px(21.0), f.title, f.title_color, 400);
+        }
+
+        // Thin lines at the size of the icons of the GPU frame (Lucide, 2 px strokes on a 24 px grid).
+        let pen = |c: Rgb| CreatePen(PS_SOLID, px(1.0).max(1), color(c));
+        let line = |x0: i32, y0: i32, x1: i32, y1: i32| {
+            MoveToEx(dc, x0, y0, std::ptr::null_mut::<POINT>());
+            LineTo(dc, x1, y1);
+        };
+        let (h4, h3) = (px(4.0), px(3.0));
+        // New tab (+) and the profile menu (chevron), 26 px apart after the tab name.
+        let dim_pen = pen(f.title_color);
+        let old = SelectObject(dc, dim_pen);
+        let plus = x + px(14.0);
+        line(plus - h4, mid, plus + h4 + 1, mid);
+        line(plus, mid - h4, plus, mid + h4 + 1);
+        let chevron = plus + px(26.0);
+        line(chevron - h3, mid - px(1.5), chevron, mid + px(1.5));
+        line(chevron, mid + px(1.5), chevron + h3 + 1, mid - px(1.5) - 1);
+        SelectObject(dc, old);
+        DeleteObject(dim_pen);
+
+        // Minimize, maximize, and close.
+        let fg_pen = pen(f.fg);
+        let old = SelectObject(dc, fg_pen);
+        let button = px(46.0);
+        let center = |i: i32| w - (3 - i) * button + button / 2;
+        line(center(0) - h4, mid, center(0) + h4 + 1, mid);
+        let c = center(1);
+        line(c - h4, mid - h4, c + h4, mid - h4);
+        line(c + h4, mid - h4, c + h4, mid + h4);
+        line(c + h4, mid + h4, c - h4, mid + h4);
+        line(c - h4, mid + h4, c - h4, mid - h4);
+        let c = center(2);
+        line(c - h3, mid - h3, c + h3 + 1, mid + h3 + 1);
+        line(c + h3, mid - h3, c - h3 - 1, mid + h3 + 1);
+        SelectObject(dc, old);
+        DeleteObject(fg_pen);
         ReleaseDC(hwnd, dc);
     }
 }
 
+/// On macOS, the window has a background color of its own.
 #[cfg(not(windows))]
-pub fn paint_background(_window: &Window, _color: Rgb) {}
+pub fn paint_first_frame(_window: &Window, _f: &FirstFrame) {}
 
 /// A shortcut label for this system. macOS uses the Command key for the bebo shortcuts.
 pub fn keys(label: &'static str) -> &'static str {

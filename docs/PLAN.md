@@ -719,3 +719,23 @@ bebo builds for macOS 11 or later, for Apple Silicon and Intel. `src/platform.rs
 ## 25. Move tabs (2026-11-18)
 
 A press on a tab starts a drag. The tab follows the mouse on a layer above the other tabs. When the mouse passes over another place, the tabs change places, and the other tabs slide to their new places (the same animation as the popups). Only the x position counts. After the release, the tab slides into its place. The hit rectangles stay at the places, not at the animated positions, so the order changes only at fixed points. Each tab has a fixed id for its animation, because its index changes. A click with no move still selects the tab, and a double click still renames it.
+
+## 26. Start speed (2026-11-18)
+
+With the settings of the test user (terminal font SF Mono, weight 500, interface font SF Pro Display), the window was empty for about 580 ms. Medians of 5 starts on the test PC:
+
+| | Before | After |
+|---|---|---|
+| Window with its first frame | ~100 ms (empty) | 31 ms (GDI title bar) |
+| GPU frame | 683 ms | 295 ms |
+| Prompt | ~460-530 ms | 371 ms |
+
+1. **Font list.** A font that is not in the short start list made bebo read all 589 system font files (about 430 ms). bebo now writes `fonts.txt` (family and file) next to `settings.txt` after a full scan, and loads only the files of the fonts in use. A font that the list does not have (a new font) gives one full scan again.
+2. **Font thread.** The fonts load, and their first text layout runs, on a second thread while the GPU starts.
+3. **Start order.** The GPU thread loads the OpenGL driver, and Windows loads only one DLL at a time. The administrator check (shell32.dll) then waited about 48 ms, before the shell started. The shell now starts first (at about 34 ms), then the GPU thread, then the icon and the administrator check.
+4. **PowerShell script.** The key handler and the colors of PSReadLine cost about 60 ms. They now run at the first line read, after the prompt is on the screen.
+5. **GDI first frame.** The window opens first, at about 30 ms, and GDI draws the title bar at once: the icon, the name, the tab name, the new tab and menu buttons, and the window buttons, at the same places as the GPU frame (`platform::paint_first_frame`). Geist goes to GDI with `AddFontMemResourceEx`. The GPU frame replaces it at about 300 ms; only the shell badge is new then.
+6. **Shell thread.** The first shell starts on a second thread in `main`, while the window opens. Median of 10 starts: prompt at 371 ms (395 ms before).
+7. **Administrator check.** The elevation of the process token, not `IsUserAnAdmin`, which loads shell32.dll.
+
+What remains: the NVIDIA OpenGL driver needs about 185 ms, and Windows PowerShell 5.1 needs about 200 ms to start (65 ms more for PSReadLine).
