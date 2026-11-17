@@ -1,13 +1,18 @@
 # Installs bebo for the current user. Administrator rights are not necessary.
 # The script copies bebo.exe to %LOCALAPPDATA%\Programs\bebo, adds a Start menu shortcut,
 # and adds bebo to "Installed apps" in Windows Settings, so that Windows can uninstall it.
+# -Box shows the result in a message box. The setup .exe uses it, because its console is hidden.
+param([switch]$Box)
 $ErrorActionPreference = 'Stop'
+function Say([string]$text, [int]$icon) {
+    if ($Box) { (New-Object -ComObject WScript.Shell).Popup($text, 0, 'bebo setup', $icon) | Out-Null } else { Write-Host $text }
+}
 $source = Join-Path $PSScriptRoot 'bebo.exe'
 $dir = Join-Path $env:LOCALAPPDATA 'Programs\bebo'
 $exe = Join-Path $dir 'bebo.exe'
 
 if (Get-Process bebo -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe }) {
-    Write-Host 'Close all bebo windows, then run the installer again.' -ForegroundColor Yellow
+    Say 'Close all bebo windows, then run the installer again.' 48
     exit 1
 }
 
@@ -38,5 +43,4 @@ Set-ItemProperty -Path $key -Name NoModify -Value 1 -Type DWord
 Set-ItemProperty -Path $key -Name NoRepair -Value 1 -Type DWord
 Set-ItemProperty -Path $key -Name EstimatedSize -Value ([int]((Get-Item $exe).Length / 1KB)) -Type DWord
 
-Write-Host "bebo is installed in $dir." -ForegroundColor Green
-Write-Host 'Open it from the Start menu. To remove it, use Settings > Apps > Installed apps.'
+Say "bebo is installed in $dir.`nOpen it from the Start menu. To remove it, use Settings > Apps > Installed apps." 64

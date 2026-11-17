@@ -595,10 +595,16 @@ Not changed, with the reason:
 
 ### Install package
 
-Run `installeruild.ps1`. It builds bebo and makes `distebo-<version>-x64.zip`.
-To install, extract the zip and double-click `Install bebo.cmd`. The installer:
+Run `installer\build.ps1`. It builds bebo and makes two packages:
 
-- copies `bebo.exe` to `%LOCALAPPDATA%\Programsebo` (no administrator rights),
+- `dist\bebo-<version>-setup.exe`: double-click it to install. IExpress, which is part of Windows, makes it. The result shows in a message box.
+- `dist\bebo-<version>-x64.zip`: extract it and double-click `Install bebo.cmd`.
+
+The setup .exe is not signed. If you download it from the internet, Windows SmartScreen shows a warning. A code signing certificate removes the warning.
+
+Both packages run the same install script. The installer:
+
+- copies `bebo.exe` to `%LOCALAPPDATA%\Programs\bebo` (no administrator rights),
 - adds a Start menu shortcut,
 - adds bebo to "Installed apps" in Windows Settings, with an uninstaller.
 
