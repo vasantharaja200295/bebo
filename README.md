@@ -98,6 +98,8 @@ The result is `dist\bebo-<version>-setup.exe`.
 - [docs/PLAN.md](docs/PLAN.md): the design, each decision, and each measurement.
 - [docs/LEARNING-GUIDE.md](docs/LEARNING-GUIDE.md): build a terminal emulator yourself, stage by stage.
 
-## Fonts
+## License
+
+bebo is under the MIT License; see [LICENSE](LICENSE).
 
 The interface font Geist is inside bebo under the SIL Open Font License; see [assets/fonts/OFL.txt](assets/fonts/OFL.txt). The icons come from Lucide.
