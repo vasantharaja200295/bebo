@@ -215,7 +215,7 @@ Test: idle CPU must be zero. A key must show on the screen in less than one fram
 5. **Panic in a thread**: if the PTY thread stops, the pane goes blank. Find a way to see the panic message.
 6. **Minimize**: minimize the window and restore it. Log each resize event. Windows sends a size of 160x28 to a minimized window. Find out what the shell does with a terminal that is only a few columns wide, and why the restore does not repair it.
 
-### Stage 12b: Links, fonts, and panes
+### Stage 12b: Links, fonts, panes, and contrast
 
 1. **Wrapped links**: join the rows of a wrapped line with the `WRAPLINE` flag of the last cell. Find a URL that wraps, and check that the click opens all of it.
 2. **Link color**: give every URL in the view a color. Do the search once for each wrapped line, not once for each row. Think about why file paths get color only below the mouse.
@@ -224,6 +224,7 @@ Test: idle CPU must be zero. A key must show on the screen in less than one fram
 5. **Prompt weight**: draw the prompt rows heavier than the output. Try +50 first, and compare the pixels of the two rows. Find out why +50 gives no change with a normal font file.
 6. **Interface font**: let the user select the font of the tabs and menus. Open the font list above its box if the window has no room below it.
 7. **Pane keys**: move the focus to the pane on the left, right, top, or bottom with the keyboard. Of the panes on that side, select the nearest pane, then the pane nearest to the middle of the current pane. Send the keys to the shell when the tab has only one pane.
+8. **Contrast**: write a function that gives the WCAG contrast ratio of two colors. Check each text color of each theme against the background and against a selected row. Raise each color below 4.5:1: mix it toward white in a dark theme, or toward black in a light theme, in small steps until it passes. Think about why the hue then stays the same. Leave black and white as they are, and find out why. Write a unit test for the rule, so that a later color change cannot break it.
 
 ### Stage 13: Install
 
@@ -264,5 +265,5 @@ Ask these questions:
 - [ ] 10 Own window, popups in layers, settings
 - [ ] 11 Animation, frame pacing, profiler
 - [ ] 12 Resize, minimize, wide characters, encoding faults
-- [ ] 12b Links, fonts, pane keys
+- [ ] 12b Links, fonts, pane keys, contrast
 - [ ] 13 Install
