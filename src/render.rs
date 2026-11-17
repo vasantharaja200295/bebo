@@ -622,9 +622,10 @@ impl Gpu {
 
         // Keep only the rows that this frame used.
         let frame_number = self.frame_number;
-        // Shaped rows stay for a later frame, for example after a scroll back. Above 1500 rows, only the rows of this frame stay.
+        // Shaped rows stay for a later frame, for example after a scroll back. Above 400 rows (about 10 screens,
+        // about 4 MB), only the rows of this frame stay.
         // ponytail: one cleanup removes all old rows. Use an LRU order if the cleanup frame is slow.
-        if self.row_cache.len() > 1500 {
+        if self.row_cache.len() > 400 {
             self.row_cache.retain(|_, entry| entry.2 + 1 >= frame_number);
         }
         self.atlas.trim();
@@ -634,9 +635,10 @@ impl Gpu {
 /// Built-in profiler. With BEBO_PROFILE set to a file path, bebo adds the time of each named step
 /// and writes a table to the file every second: count, total, mean, and maximum in microseconds.
 pub mod prof {
+    use std::alloc::{GlobalAlloc, Layout, System};
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     static ON: AtomicBool = AtomicBool::new(false);
@@ -664,10 +666,32 @@ pub mod prof {
         }
     }
 
+    /// Counts the heap memory of bebo: the bytes in use now and the maximum. The GPU driver uses its own memory, so it is not in this count.
+    pub struct Counter;
+    static HEAP: AtomicUsize = AtomicUsize::new(0);
+    static HEAP_MAX: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for Counter {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let now = HEAP.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            HEAP_MAX.fetch_max(now, Ordering::Relaxed);
+            // SAFETY: the caller keeps the contract of `GlobalAlloc`.
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            HEAP.fetch_sub(layout.size(), Ordering::Relaxed);
+            // SAFETY: the caller keeps the contract of `GlobalAlloc`.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
     pub fn write() {
         let Some(path) = std::env::var_os("BEBO_PROFILE") else { return };
         let data = DATA.lock().unwrap();
-        let mut text = format!("{:<22} {:>9} {:>12} {:>9} {:>9}\n", "step", "count", "total", "mean", "max");
+        let mb = |v: usize| v as f64 / 1048576.0;
+        let mut text = format!("heap now {:.1} MB, heap maximum {:.1} MB
+", mb(HEAP.load(Ordering::Relaxed)), mb(HEAP_MAX.load(Ordering::Relaxed)));
+        text += &format!("{:<22} {:>9} {:>12} {:>9} {:>9}\n", "step", "count", "total", "mean", "max");
         for (name, (n, total, max)) in data.iter() {
             text += &format!("{name:<22} {n:>9} {total:>12} {:>9} {max:>9}\n", total / (*n).max(1));
         }

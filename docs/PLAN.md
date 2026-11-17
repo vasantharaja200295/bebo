@@ -590,3 +590,73 @@ Not changed, with the reason:
 - The shell prompt shows at about 450 ms. That is the start time of Windows PowerShell 5.1 and the user profile, not bebo.
 - DirectX 12 has Mailbox mode, but its start is about 600 ms slower than OpenGL on this PC.
 - The large output time is the speed of the program that writes (see section 11).
+
+## 19. Install package and comparison with Windows Terminal (2026-11-17)
+
+### Install package
+
+Run `installeruild.ps1`. It builds bebo and makes `distebo-<version>-x64.zip`.
+To install, extract the zip and double-click `Install bebo.cmd`. The installer:
+
+- copies `bebo.exe` to `%LOCALAPPDATA%\Programsebo` (no administrator rights),
+- adds a Start menu shortcut,
+- adds bebo to "Installed apps" in Windows Settings, with an uninstaller.
+
+bebo needs nothing more on the PC: the fonts, the icons, and the shell script are inside `bebo.exe`.
+
+### Comparison
+
+Windows Terminal 1.24.12741.0 and bebo 0.1.0, both with Windows PowerShell 5.1 and the user profile, on the test PC (GTX 1650). Launch values are the median of 3 starts.
+
+| Item | Windows Terminal | bebo |
+|---|---|---|
+| Window shows | 548 ms | 28 ms (background color), 291 ms (first full frame) |
+| Shell prompt ready | 759 ms | 521 ms |
+| Memory at idle (terminal + console host), working set | 111 MB | 91 MB |
+| Memory at idle, private | 76 MB | 103 MB |
+| CPU at idle, 10 s | 0 ms | 0 ms |
+| 200,000 lines (35 MB) with `cat.exe` | 0.6 s | 2.8 s |
+| The same file with `cmd /c type` | 20.3 s | 27.5 s |
+| Key to screen | not measured | 4.3 ms (built-in profiler) |
+| Install size | 17 MB (package) | 9.4 MB (one file) |
+
+- Windows Terminal is faster with large output. It uses its own newer console host (OpenConsole). bebo uses the console host of Windows.
+- Section 11 says that the newer console host stopped `cat.exe` output. The first test had faults (see below), so the test was done again with a better method.
+- The tests could not measure the key-to-screen time of Windows Terminal.
+
+## 20. Second test of the newer console host (2026-11-17)
+
+The test runs the command through the test aid `BEBO_RUN`: the shell script runs the command before the first prompt, so no typing is necessary. The command writes its time to a file. Same 35 MB file.
+
+| Command | Console host of Windows | Newer console host 1.25 (OpenConsole) |
+|---|---|---|
+| `cat.exe` | 2.8 s, 2.9 s, 2.8 s | stopped, stopped, stopped |
+| `cmd /c type` | 25.6 s | 22.4 s |
+| `Get-Content` | 34.8 s | 30.9 s |
+
+- With the newer console host, `cat.exe` output stops after about 115 KB in each run. This is a real fault, not a test fault.
+- At start, the newer console host sends `ESC [1t`, `ESC [c`, `ESC [?1004h`, `ESC [?9001h`, and `ESC [6n`. bebo answers the cursor position request. The cause of the stop is not found yet. Windows Terminal uses the same host with no stop, so it answers or does something that bebo does not.
+- Decision: bebo keeps the console host of Windows. The gain of 10 to 12 % for slow writers does not justify the risk.
+
+Faults in the earlier tests, for the record:
+
+- The test tool sends "~" as Enter, and the short path of the test folder has a "~". The typed command was cut.
+- A test window behind other windows does not show new frames. A screenshot then shows an old frame or an empty window.
+
+Test aid: `BEBO_RUN` holds a PowerShell command. The bebo script runs it before the first prompt.
+
+## 21. Memory (2026-11-17)
+
+The profiler now counts the heap of bebo: a counting allocator adds and removes the size of each allocation. `BEBO_PROFILE` writes the current and the maximum heap. The GPU driver has its own memory, so it is not in this count.
+
+| Case | Heap of bebo | Private memory of the process |
+|---|---|---|
+| Idle, one tab | 8.1 MB | 87 MB |
+| Five tabs | 36.7 MB | 120 MB |
+| After 200,000 lines (full scrollback), before | 52.6 MB (maximum 75.6 MB) | 127 MB |
+| After 200,000 lines, after the change | 43.2 MB (maximum 44.8 MB) | 125 MB |
+
+- At idle, about 79 MB of the 87 MB is not bebo: the NVIDIA OpenGL driver (`nvoglv64.dll`, `nvgpucomp64.dll`) and Windows libraries.
+- Each tab adds about 7 MB. About 4 MB of that is fixed buffers in the libraries: two 1 MB pipe buffers (alacritty_terminal) and a 2 MB buffer for synchronized output (vte). bebo cannot change them without a copy of the libraries.
+- A full scrollback of 10,000 lines at 120 columns uses about 29 MB.
+- Change: the cache of shaped rows has a limit of 400 rows (about 10 screens), not 1500. That saves about 10 MB after large output. Scrolling back more than 10 screens shapes the rows again, at about 30 us for each row.

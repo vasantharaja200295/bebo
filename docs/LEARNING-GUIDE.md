@@ -183,11 +183,49 @@ Now you add the features that make it your terminal.
 - The Kitty keyboard protocol.
 - Measure input latency. Read about "typometer".
 
+### Stage 10: Your own window and interface
+
+The primary version draws its own title bar, tabs, popups, and settings. Do the same after stage 8.
+
+1. **Window with no frame**: turn off the Windows frame. Draw a title bar. Find out how to start a window move and a window resize from your own code. Keep the Windows 11 shadow and rounded corners.
+2. **Hit list**: each frame, record each control rectangle and its action. A click looks for the last rectangle that contains the mouse. Think about why the last one, not the first one.
+3. **Layers**: draw in this order: cell backgrounds, terminal text, interface rectangles, interface text. Then each popup as its own layer of rectangles and text. Open a menu and the palette at the same time. If the menu text shows through the palette, your popups share one layer.
+4. **Icons and images**: an icon font is the easy way. A PNG image needs a texture. Find how your text library draws a custom glyph from RGBA pixels.
+5. **Settings**: keep the settings as `key=value` lines in a file in `%APPDATA%`. Read the file at start. Write it after each change. A wrong line must keep the default value. Write a unit test that writes the settings and reads them back.
+6. **Font list**: load only the fonts that you use at start. Load the system font list only when the user opens the font list. Measure the start time with and without the full list.
+
+Test: open each popup on top of each other popup. Resize the window to its minimum size. No text may show through, and no control may go off the window.
+
+### Stage 11: Motion and speed
+
+1. **Animation**: move a value a part of the distance in each frame, with the frame time. Find the formula that gives the same speed at 60 Hz and at 144 Hz. Stop the frames when the value is at the target.
+2. **Frame pacing**: count the frames for one typed key. Find the frames that show nothing new, and remove them.
+3. **Vsync**: measure the time of the present call with vsync. Think about what the event loop does while it waits. Measure the time from a key press to the screen with and without vsync.
+4. **Profiler**: add a timer for each step of a frame (build, text, present), and a counter for the PTY bytes. Write a table to a file. Use it before each optimization, and after.
+5. **Large output**: limit the frames during fast output. Compare `type`, `Get-Content`, and `cat.exe` with the same file. Find out which part is slow: the program, the console host, or your terminal.
+
+Test: idle CPU must be zero. A key must show on the screen in less than one frame of your display.
+
+### Stage 12: Faults that only real use shows
+
+1. **Resize**: make the window small, then large. Is the old output still there? Compare your grid with the screen that ConPTY thinks it has. Change only the height, then only the width, then both.
+2. **Cursor at the end of a row**: type to the last column. Where is the cursor? Read about the "pending wrap" state.
+3. **Wide characters**: print Chinese text and an emoji. Do the next characters stay on the cell grid? Which font has the glyph?
+4. **Encoding**: print text with `[Console]::Write` in Windows PowerShell 5.1. Find out why you get `???`, and which setting changes it.
+5. **Panic in a thread**: if the PTY thread stops, the pane goes blank. Find a way to see the panic message.
+
+### Stage 13: Install
+
+1. Embed the icon in the program file with a build script.
+2. Write an install script for the current user: copy the program, add a Start menu shortcut, and add an entry in "Installed apps" so that Windows can uninstall it. No administrator rights.
+3. Install on a clean user account. Check that the program needs nothing more.
+
 ## 4. How to debug a terminal
 
 - Log each parser event to a file. Most display bugs are one wrong or missing sequence.
 - Record the raw PTY bytes to a file. Replay the file into your parser in a unit test.
 - Compare with a terminal that works. Run the same program in Windows Terminal.
+- Test a window that is behind other windows with care. Windows may not show its new frames, and a screenshot then shows an old frame.
 - `vttest` shows which sequence is wrong.
 - In WSL, `infocmp xterm-256color` shows what programs expect from you. Set `TERM=xterm-256color`.
 
@@ -212,3 +250,7 @@ Ask these questions:
 - [ ] 7 GPU renderer
 - [ ] 8 Your features
 - [ ] 9 Go deeper
+- [ ] 10 Own window, popups in layers, settings
+- [ ] 11 Animation, frame pacing, profiler
+- [ ] 12 Resize, wide characters, encoding faults
+- [ ] 13 Install

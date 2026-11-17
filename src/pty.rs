@@ -254,6 +254,10 @@ pub fn spawn_shell(
     if let Some(banner) = banner {
         env.insert("BEBO_BANNER".into(), banner);
     }
+    // Test aid: the PowerShell script runs the command in BEBO_RUN before the first prompt.
+    if let Ok(run) = std::env::var("BEBO_RUN") {
+        env.insert("BEBO_RUN".into(), run);
+    }
 
     let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("path")).map(|(_, v)| v.clone()).unwrap_or_default();
     let program = find_program(&path, profile.program()).unwrap_or_else(|| profile.program().to_string());

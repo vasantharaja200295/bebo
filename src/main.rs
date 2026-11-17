@@ -34,6 +34,10 @@ use pty::{Mark, Profile, Proxy, SharedTerm, TermSize, UserEvent};
 use render::Gpu;
 use theme::{Rgb, Theme};
 
+/// Counts the heap memory for the profiler. The cost is one atomic add for each allocation.
+#[global_allocator]
+static HEAP: render::prof::Counter = render::prof::Counter;
+
 const FONT_PX: f32 = 13.0;
 /// The limits of the terminal font size in logical pixels, for the keys and for the settings page.
 const FONT_MIN: f32 = 8.0;

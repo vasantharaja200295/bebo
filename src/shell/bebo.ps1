@@ -45,3 +45,8 @@ if ($env:BEBO_BANNER) {
   [Console]::WriteLine($global:__bebo_e + '[' + $parts[0] + 'm' + $parts[1] + $global:__bebo_e + '[0m');
   $env:BEBO_BANNER = $null
 };
+if ($env:BEBO_RUN) {
+  $run = $env:BEBO_RUN;
+  $env:BEBO_RUN = $null;
+  Invoke-Expression $run
+};
