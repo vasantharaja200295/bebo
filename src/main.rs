@@ -177,6 +177,8 @@ impl Node {
 }
 
 struct Tab {
+    /// A number that stays with the tab when the tab moves: the id of its first pane, or `usize::MAX` for the settings tab.
+    id: usize,
     root: Node,
     focus: usize,
     /// Name from the rename command.
@@ -486,6 +488,8 @@ const A_CONFIRM: u32 = 6;
 const A_SWITCH: u32 = 50;
 /// Pane `n` uses `A_CARET + 2 * n` for the caret x position and the next key for the caret row.
 const A_CARET: u32 = 1000;
+/// Tab `id` uses `A_TAB + id` for its x position in the tab bar.
+const A_TAB: u32 = 1 << 30;
 
 /// Values that move to a target in a short time. `draw` sets `dt` for each frame.
 #[derive(Default)]
@@ -659,6 +663,8 @@ struct App {
     press: Option<Press>,
     drag_divider: Option<usize>,
     drag_minimap: Option<usize>,
+    /// The tab that the mouse moves in the tab bar, and the distance from the left side of the tab to the mouse.
+    drag_tab: Option<(usize, f32)>,
     last_click: (Instant, Point, u8),
     last_title_click: Instant,
     /// Time and tab of the last click on a tab. A double click renames the tab.
@@ -788,7 +794,7 @@ impl App {
         let profile = profile.or(self.focus_pane().map(|p| p.profile)).unwrap_or_else(Profile::default_profile);
         let size = self.focus_pane().map_or((100, 30), |p| (p.cols, p.rows));
         let id = self.new_pane(cwd, profile, size);
-        self.tabs.push(Tab { root: Node::Leaf(id), focus: id, name: None, settings: false });
+        self.tabs.push(Tab { id, root: Node::Leaf(id), focus: id, name: None, settings: false });
         self.active = self.tabs.len() - 1;
         self.relayout();
     }
@@ -1184,6 +1190,10 @@ impl App {
                 if double && !self.tabs[i].settings {
                     let query = self.tabs[i].name.clone().unwrap_or_default();
                     self.palette = Some(Palette { rename: true, query, ..Default::default() });
+                } else {
+                    // The mouse can now move the tab to another place in the tab bar. The tab keeps its distance to the mouse.
+                    let left = self.hits.iter().find_map(|(r, hit)| (*hit == Hit::Tab(i)).then_some(r.x));
+                    self.drag_tab = Some((i, self.mouse.0 - left.unwrap_or(self.mouse.0)));
                 }
                 self.relayout();
             },
@@ -1276,6 +1286,27 @@ impl App {
 
     fn mouse_move(&mut self) {
         let (x, y) = self.mouse;
+        // A tab that the mouse moves changes place with the tab below the mouse. Only the x position counts,
+        // so the drag also works a little above or below the tab bar.
+        // The hit rectangles of the tabs are their places in the bar, not their animated positions.
+        if let Some((from, grab)) = self.drag_tab {
+            let over = self.hits.iter().find_map(|(r, hit)| match hit {
+                Hit::Tab(i) if x >= r.x && x < r.x + r.w => Some(*i),
+                _ => None,
+            });
+            if let Some(to) = over.filter(|to| *to != from && *to < self.tabs.len()) {
+                let tab = self.tabs.remove(from);
+                self.tabs.insert(to, tab);
+                self.active = to;
+                self.drag_tab = Some((to, grab));
+                // A click after a move is not the second click of a double click.
+                self.last_tab_click.1 = usize::MAX;
+                self.relayout();
+            }
+            // The tab follows the mouse in each frame.
+            self.redraw();
+            return;
+        }
         if let Some(i) = self.drag_divider {
             let d = &self.dividers[i];
             let ratio = if d.side_by_side { (x - d.parent.x) / d.parent.w } else { (y - d.parent.y) / d.parent.h };
@@ -1360,6 +1391,10 @@ impl App {
     fn mouse_release(&mut self) {
         self.drag_divider = None;
         self.drag_minimap = None;
+        // The dragged tab slides to its place in the next frames.
+        if self.drag_tab.take().is_some() {
+            self.redraw();
+        }
         let Some(press) = self.press.take() else { return };
         if press.reported {
             let (x, y) = self.mouse;
@@ -1707,7 +1742,7 @@ impl App {
                 match self.tabs.iter().position(|t| t.settings) {
                     Some(index) => self.active = index,
                     None => {
-                        self.tabs.push(Tab { root: Node::Leaf(usize::MAX), focus: usize::MAX, name: None, settings: true });
+                        self.tabs.push(Tab { id: usize::MAX, root: Node::Leaf(usize::MAX), focus: usize::MAX, name: None, settings: true });
                         self.active = self.tabs.len() - 1;
                     },
                 }
@@ -2740,6 +2775,7 @@ fn main() {
         press: None,
         drag_divider: None,
         drag_minimap: None,
+        drag_tab: None,
         last_click: (start, Point::new(Line(0), Column(0)), 0),
         last_title_click: start,
         last_tab_click: (start, usize::MAX),

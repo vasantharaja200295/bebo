@@ -297,15 +297,32 @@ impl App {
             let compact = tab_w < 80.0 * s;
             // The tab below the mouse that does not show its full name: (center, name).
             let mut tip: Option<(f32, String)> = None;
-            for (i, tab) in self.tabs.iter().enumerate() {
-                let r = Rect { x, y: 4.0 * s, w: tab_w - 3.0 * s, h: m.bar - 8.0 * s };
-                let (active, hot) = (i == self.active, ui.hot(r));
+            // Each tab slides to its place. The tab that the mouse drags follows the mouse and is on top of the others.
+            // The hit rectangle of a tab is its place, so that the order changes only when the mouse passes the middle of a place.
+            let (x0, n) = (x, self.tabs.len());
+            let dragged = self.drag_tab.map(|(i, _)| i);
+            let order = (0..n).filter(|i| Some(*i) != dragged).chain(dragged);
+            for i in order {
+                let tab = &self.tabs[i];
+                let slot = Rect { x: x0 + i as f32 * tab_w, y: 4.0 * s, w: tab_w - 3.0 * s, h: m.bar - 8.0 * s };
+                let key = A_TAB.wrapping_add(tab.id as u32);
+                let draw_x = match self.drag_tab {
+                    Some((d, grab)) if d == i => {
+                        let x = (ui.mouse.0 - grab).clamp(x0, x0 + (n - 1) as f32 * tab_w);
+                        ui.anim.set(key, x);
+                        ui.layer();
+                        x
+                    },
+                    _ => ui.anim.to(key, slot.x, 0.5),
+                };
+                let r = Rect { x: draw_x, ..slot };
+                let (active, hot) = (i == self.active, dragged.is_none() && ui.hot(slot));
                 if active {
                     ui.panel(r, t.bg, 5.0 * s);
                 } else if hot {
                     ui.rect(r, t.panel_hi, 255, 5.0 * s);
                 }
-                ui.hit(r, Hit::Tab(i));
+                ui.hit(slot, Hit::Tab(i));
                 let color = if active { t.fg } else { t.dim };
                 let pane = self.panes.get(&tab.focus);
                 let title = pane.map_or("Settings".to_string(), |pane| self.tab_title(i, pane));
@@ -331,18 +348,23 @@ impl App {
                     ui.clip = [0.0, 0.0, ui.w, ui.h];
                 }
                 if show_close {
-                    let close_hot = ui.hot(close);
+                    let close_hot = dragged.is_none() && ui.hot(close);
                     if close_hot {
                         ui.rect(close, mix(t.panel_hi, t.fg, 0.12), 255, 4.0 * s);
                     }
                     ui.icon(close.x + close.w / 2.0, mid, Icon::X, if close_hot { t.fg } else { t.dim }, 11.0);
-                    ui.hit(close, Hit::TabClose(i));
+                    if dragged.is_none() {
+                        ui.hit(close, Hit::TabClose(i));
+                    }
                 }
                 if hot && (compact || ui.width(&title, Font::Ui, 12.0) > room) {
                     tip = Some((r.x + r.w / 2.0, title));
                 }
-                x += tab_w;
+                if dragged == Some(i) {
+                    ui.popup = false;
+                }
             }
+            x = x0 + n as f32 * tab_w;
             // The full name shows below a tab that has no room for it.
             if let Some((center, title)) = tip.filter(|_| !self.menu && self.palette.is_none()) {
                 let width = ui.width(&title, Font::Ui, 11.5) + 18.0 * s;

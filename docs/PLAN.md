@@ -715,3 +715,7 @@ bebo builds for macOS 11 or later, for Apple Silicon and Intel. `src/platform.rs
 - The GitHub Actions workflow `macOS` runs the tests on a Mac, builds `bebo.app`, and keeps the disk image as an artifact.
 - Not tested on a real Mac: the window, the keys, the zsh and bash marks, and the fonts. Test these on a Mac before you give the app to other people.
 - The app has no Developer ID signature and is not notarized. macOS stops the first start; the user opens it from System Settings > Privacy & Security. Notarization needs a paid Apple Developer account.
+
+## 25. Move tabs (2026-11-18)
+
+A press on a tab starts a drag. The tab follows the mouse on a layer above the other tabs. When the mouse passes over another place, the tabs change places, and the other tabs slide to their new places (the same animation as the popups). Only the x position counts. After the release, the tab slides into its place. The hit rectangles stay at the places, not at the animated positions, so the order changes only at fixed points. Each tab has a fixed id for its animation, because its index changes. A click with no move still selects the tab, and a double click still renames it.

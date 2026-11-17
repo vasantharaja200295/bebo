@@ -5,7 +5,7 @@ bebo is a GPU terminal emulator for Windows and macOS, written in Rust. On Windo
 ## Features
 
 - **Fast:** a key shows on the screen in about 4 ms. The idle CPU use is zero. The window shows in about 30 ms.
-- **Tabs and panes:** split a tab left and right, or top and bottom. Move between panes with the keyboard. Rename a tab with a double-click.
+- **Tabs and panes:** split a tab left and right, or top and bottom. Move between panes with the keyboard. Drag a tab to move it in the tab bar. Rename a tab with a double-click.
 - **Command blocks:** each command shows its duration and its exit code. The minimap shows failed commands and find matches.
 - **Links:** a click opens a URL or a file path, also when the link wraps to the next row. URLs have color. A drag selects the text.
 - **Find:** search the output as plain text or as a regular expression.
