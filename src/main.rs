@@ -2613,7 +2613,8 @@ fn resolve_link(text: &str, cwd: Option<&std::path::Path>) -> Option<String> {
     if text.starts_with("http://") || text.starts_with("https://") {
         return Some(text.to_string());
     }
-    let mut path = text.strip_prefix("file:///").unwrap_or(text);
+    // file:///C:/a is C:/a on Windows. file:///Users/a is /Users/a on macOS.
+    let mut path = text.strip_prefix(if cfg!(windows) { "file:///" } else { "file://" }).unwrap_or(text);
     for _ in 0..2 {
         match path.rsplit_once(':') {
             Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => path = head,
@@ -2818,7 +2819,11 @@ mod tests {
         assert_eq!(token_at(&line, 40), r"src\main.rs:12:5");
         assert_eq!(resolve_link("https://example.com/a", None).as_deref(), Some("https://example.com/a"));
         let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(resolve_link(r"src\main.rs:12:5", Some(cwd)).unwrap().ends_with("main.rs"));
+        let local = format!("src{}main.rs:12:5", std::path::MAIN_SEPARATOR);
+        assert!(resolve_link(&local, Some(cwd)).unwrap().ends_with("main.rs"));
+        let absolute = cwd.join("Cargo.toml");
+        let url = if cfg!(windows) { format!("file:///{}", absolute.display()) } else { format!("file://{}", absolute.display()) };
+        assert!(resolve_link(&url, None).is_some(), "{url}");
         assert_eq!(resolve_link("no-such-file.txt", Some(cwd)), None);
         assert_eq!(resolve_link("javascript:alert(1)", Some(cwd)), None);
     }
@@ -2865,7 +2870,8 @@ mod ui_tests {
         let (mut settings, bottom) = Settings::parse("theme=light\nposition=bottom\ncursor=block\nfont_size=99\nbad line\n");
         assert!(bottom && settings.theme == 1 && settings.cursor == 1 && settings.font_px == FONT_MAX && settings.minimap);
         settings.minimap = false;
-        settings.profile = Some(Profile::Cmd);
+        // A profile that exists on this system: Windows PowerShell on Windows, bash on macOS.
+        settings.profile = Some(Profile::ALL[1]);
         let (again, bottom) = Settings::parse(&settings.to_text(false));
         assert!(!bottom && again == settings);
     }
