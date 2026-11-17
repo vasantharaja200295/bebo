@@ -677,3 +677,11 @@ The profiler now counts the heap of bebo: a counting allocator adds and removes 
 - **Pane keys.** Alt+Left, Alt+Right, Alt+Up, and Alt+Down move the focus to the pane on that side. With one pane, the shell gets these keys. The command palette has the same commands ("Focus pane left" and the others).
 - **Prompt weight.** The prompt rows (the prompt line of each command and the command line now) are one weight step heavier than the output: 400 gives 500 (Medium). The request was +50, but a font file has only steps of 100, and the font search picks the lower weight for 450, so +50 gave no change in a pixel test. The Medium file of the default font loads at the start.
 - **Minimize.** Windows sends a resize to 160x28 when it minimizes the window. bebo gave that size to the shell, which then wrapped the prompt into a few columns; after the restore only the end of the prompt was left. bebo now ignores a resize while the window is minimized.
+
+## 23. Blur background (2026-11-17)
+
+Settings > Appearance > Blur background (off by default, applies at the next start). The window gets the Windows 11 acrylic backdrop, as the macOS terminal blur. The terminal background is 85% opaque, so only a light blur shows. The title bar stays opaque.
+
+- The OpenGL surface and the normal DirectX 12 swap chain support only opaque alpha. Only a DirectX 12 swap chain on a DirectComposition visual (`Dx12SwapchainKind::DxgiFromVisual`) supports pre-multiplied alpha. So blur uses DirectX 12.
+- Cost on the test PC (GTX 1650): private memory 342 MB, not 86 MB, and the first frame at about 570 ms, not about 250 ms. All of this cost comes from DirectX 12; DirectX 12 with no blur uses the same memory.
+- Windows shows the acrylic only while the window is active. An inactive window shows a plain fallback color.

@@ -130,9 +130,10 @@ pub struct Device {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    blur: bool,
 }
 
-pub fn init_device(t0: std::time::Instant) -> Device {
+pub fn init_device(t0: std::time::Instant, blur: bool) -> Device {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     // OpenGL is the default: on the test PC it starts in about 250 ms and uses about 90 MB.
     // DirectX 12 needs about 600 ms and 160 MB, because wgpu examines each adapter. Set BEBO_BACKEND=dx12 to use it.
@@ -140,6 +141,12 @@ pub fn init_device(t0: std::time::Instant) -> Device {
         Ok("dx12") => wgpu::Backends::DX12,
         _ => wgpu::Backends::GL,
     };
+    // Blur needs a window with transparent pixels. Only a DirectX 12 swap chain on a DirectComposition visual has them;
+    // the OpenGL surface and the normal DirectX 12 swap chain are opaque.
+    if blur {
+        descriptor.backends = wgpu::Backends::DX12;
+        descriptor.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+    }
     let instance = wgpu::Instance::new(descriptor);
     // The dedicated GPU is the default. Set BEBO_GPU=low to use the integrated GPU.
     let power_preference = match std::env::var("BEBO_GPU").as_deref() {
@@ -154,7 +161,7 @@ pub fn init_device(t0: std::time::Instant) -> Device {
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("no GPU device");
     tick(t0, "device (thread)");
-    Device { instance, adapter, device, queue }
+    Device { instance, adapter, device, queue, blur }
 }
 
 pub struct Gpu {
@@ -179,6 +186,8 @@ pub struct Gpu {
     ui: String,
     /// Weight of the terminal font, 100 to 900. Bold text is 300 heavier.
     weight: u16,
+    /// The window shows a blurred backdrop behind the terminal background.
+    blur: bool,
     /// Images as RGBA pixels. The key is the image id and the size in pixels (the images are squares).
     images: HashMap<(u16, u16), Vec<u8>>,
     /// Shaped text for each row content. The key is the hash of the row.
@@ -196,7 +205,7 @@ pub struct Gpu {
 
 impl Gpu {
     pub fn new(window: Arc<Window>, parts: Device, font_px: f32, t0: std::time::Instant) -> Self {
-        let Device { instance, adapter, device, queue } = parts;
+        let Device { instance, adapter, device, queue, blur } = parts;
         let size = window.inner_size();
         let surface = instance.create_surface(window.clone()).expect("create surface");
         tick(t0, "surface");
@@ -214,7 +223,7 @@ impl Gpu {
                 .into_iter()
                 .find(|mode| caps.present_modes.contains(mode) && std::env::var_os("BEBO_VSYNC").is_none())
                 .unwrap_or(wgpu::PresentMode::Fifo),
-            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            alpha_mode: if blur { wgpu::CompositeAlphaMode::PreMultiplied } else { wgpu::CompositeAlphaMode::Opaque },
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
             color_space: wgpu::SurfaceColorSpace::Auto,
@@ -314,6 +323,7 @@ impl Gpu {
             families: Vec::new(),
             ui,
             weight: 400,
+            blur,
             images: HashMap::new(),
             row_cache: HashMap::new(),
             frame_number: 0,
@@ -509,6 +519,8 @@ impl Gpu {
     }
 
     pub fn render(&mut self, frame: &Frame, background: [u8; 3]) {
+        // With blur, the terminal background lets 15% of the blurred backdrop through. More looks like a glass toy.
+        let alpha = if self.blur { 0.85 } else { 1.0 };
         let t0 = std::time::Instant::now();
         self.frame_number += 1;
         let (width, height) = self.size();
@@ -626,10 +638,10 @@ impl Gpu {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let clear = wgpu::Color {
-                r: linear(background[0]) as f64,
-                g: linear(background[1]) as f64,
-                b: linear(background[2]) as f64,
-                a: 1.0,
+                r: linear(background[0]) as f64 * alpha,
+                g: linear(background[1]) as f64 * alpha,
+                b: linear(background[2]) as f64 * alpha,
+                a: alpha,
             };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,

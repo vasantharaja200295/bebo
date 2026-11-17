@@ -556,6 +556,8 @@ struct Settings {
     links: bool,
     /// The caret and the popups move smoothly.
     animations: bool,
+    /// A light blur of the windows behind the terminal text, as on macOS. It applies at the next start.
+    blur: bool,
     /// Shell of the first tab. `None`: PowerShell.
     profile: Option<Profile>,
 }
@@ -580,6 +582,7 @@ impl Settings {
             minimap: true,
             links: true,
             animations: true,
+            blur: false,
             profile: None,
         };
         let mut bottom = false;
@@ -599,6 +602,7 @@ impl Settings {
                 "minimap" => s.minimap = value != "off",
                 "links" => s.links = value != "off",
                 "animations" => s.animations = value != "off",
+                "blur" => s.blur = value == "on",
                 "profile" => s.profile = Profile::ALL.into_iter().find(|p| format!("{p:?}") == value),
                 _ => {},
             }
@@ -609,7 +613,7 @@ impl Settings {
     fn to_text(&self, bottom: bool) -> String {
         let on = |v: bool| if v { "on" } else { "off" };
         format!(
-            "theme={}\nposition={}\npopup={}\nfont={}\nfont_size={}\nfont_weight={}\nui_font={}\ncursor={}\ntab_bar={}\nminimap={}\nlinks={}\nanimations={}\nprofile={}\n",
+            "theme={}\nposition={}\npopup={}\nfont={}\nfont_size={}\nfont_weight={}\nui_font={}\ncursor={}\ntab_bar={}\nminimap={}\nlinks={}\nanimations={}\nblur={}\nprofile={}\n",
             THEMES[self.theme as usize],
             if bottom { "bottom" } else { "top" },
             POPUPS[self.popup as usize],
@@ -622,6 +626,7 @@ impl Settings {
             on(self.minimap),
             on(self.links),
             on(self.animations),
+            on(self.blur),
             self.profile.map_or(String::new(), |p| format!("{p:?}")),
         )
     }
@@ -2212,6 +2217,7 @@ impl App {
             7 => self.settings.minimap = !self.settings.minimap,
             8 => self.settings.links = !self.settings.links,
             9 => self.settings.animations = !self.settings.animations,
+            13 => self.settings.blur = !self.settings.blur,
             10 => self.settings.profile = self.profiles.get(value as usize).copied(),
             11 => {
                 let weight = if value == 1 { self.settings.font_weight + 100 } else { self.settings.font_weight.saturating_sub(100) };
@@ -2291,6 +2297,12 @@ impl ApplicationHandler<UserEvent> for App {
             .with_window_icon(self.icon.clone())
             .with_taskbar_icon(self.icon.clone())
             .with_undecorated_shadow(true);
+        // Blur: the Windows acrylic backdrop shows a blurred image of the windows behind bebo.
+        let attributes = if self.settings.blur {
+            attributes.with_transparent(true).with_system_backdrop(winit::platform::windows::BackdropType::TransientWindow)
+        } else {
+            attributes
+        };
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
         // The window shows immediately with the background color. The GPU frame comes when the device is ready.
         paint_background(&window, self.theme.bg);
@@ -2684,14 +2696,15 @@ fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     // Start the GPU on a second thread now. It is the slowest step of the start.
-    let (gpu_tx, gpu_rx) = std::sync::mpsc::channel();
-    let gpu_proxy = event_loop.create_proxy();
-    std::thread::spawn(move || {
-        let _ = gpu_tx.send(render::init_device(start));
-        let _ = gpu_proxy.send_event(UserEvent::GpuReady);
-    });
     let state = config_dir().and_then(|d| std::fs::read_to_string(d.join("settings.txt")).ok()).unwrap_or_default();
     let (settings, bottom) = Settings::parse(&state);
+    let (gpu_tx, gpu_rx) = std::sync::mpsc::channel();
+    let gpu_proxy = event_loop.create_proxy();
+    let blur = settings.blur;
+    std::thread::spawn(move || {
+        let _ = gpu_tx.send(render::init_device(start, blur));
+        let _ = gpu_proxy.send_event(UserEvent::GpuReady);
+    });
     let profiles = Profile::available();
     // `--profile` and `--cwd` come from "Open as administrator".
     let args: Vec<String> = std::env::args().collect();

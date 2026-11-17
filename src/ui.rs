@@ -484,6 +484,7 @@ impl App {
                 row("Minimap", "Marks for failed commands and find matches", Toggle(7, st.minimap)),
                 row("Clickable links", "A click opens a link or a path. Links have color.", Toggle(8, st.links)),
                 row("Animations", "The caret and the popups move smoothly", Toggle(9, st.animations)),
+                row("Blur background", "Light blur behind the text. About 250 MB more memory. Next start.", Toggle(13, st.blur)),
             ],
             1 => {
                 let names = self

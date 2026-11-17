@@ -213,12 +213,23 @@ Test: idle CPU must be zero. A key must show on the screen in less than one fram
 3. **Wide characters**: print Chinese text and an emoji. Do the next characters stay on the cell grid? Which font has the glyph?
 4. **Encoding**: print text with `[Console]::Write` in Windows PowerShell 5.1. Find out why you get `???`, and which setting changes it.
 5. **Panic in a thread**: if the PTY thread stops, the pane goes blank. Find a way to see the panic message.
+6. **Minimize**: minimize the window and restore it. Log each resize event. Windows sends a size of 160x28 to a minimized window. Find out what the shell does with a terminal that is only a few columns wide, and why the restore does not repair it.
 
-### Stage 12b: Links and fonts
+### Stage 12b: Links, fonts, and panes
 
-1. Join the rows of a wrapped line with the `WRAPLINE` flag of the last cell. Find a URL that wraps, and check that the click opens all of it.
-2. Give every URL in the view a color. Do the search once for each wrapped line, not once for each row.
-3. Add a font weight setting. Find out why a weight that you did not load at the start shows as regular.
+1. **Wrapped links**: join the rows of a wrapped line with the `WRAPLINE` flag of the last cell. Find a URL that wraps, and check that the click opens all of it.
+2. **Link color**: give every URL in the view a color. Do the search once for each wrapped line, not once for each row. Think about why file paths get color only below the mouse.
+3. **Click or drag**: a click on a link opens it, and a drag selects it. Decide this at the mouse release, not at the press. Find the two cases where a click must not open the link: the command line that the user types, and a program that gets the mouse (vim, less).
+4. **Font weight**: add a weight setting for the terminal font. Find out why a weight that you did not load at the start shows as regular.
+5. **Prompt weight**: draw the prompt rows heavier than the output. Try +50 first, and compare the pixels of the two rows. Find out why +50 gives no change with a normal font file.
+6. **Interface font**: let the user select the font of the tabs and menus. Open the font list above its box if the window has no room below it.
+7. **Pane keys**: move the focus to the pane on the left, right, top, or bottom with the keyboard. Of the panes on that side, select the nearest pane, then the pane nearest to the middle of the current pane. Send the keys to the shell when the tab has only one pane.
+
+### Stage 12c: Blur behind the window
+
+1. Ask the surface for its alpha modes. Find out why OpenGL and the normal DirectX 12 swap chain give only `Opaque`.
+2. Make a DirectX 12 swap chain on a DirectComposition visual. Clear the background with a pre-multiplied alpha below 1. Turn on the Windows acrylic backdrop for the window.
+3. Measure the start time and the memory with OpenGL and with DirectX 12. Decide if the blur is worth that cost, and make it a setting that is off by default.
 
 ### Stage 13: Install
 
@@ -258,5 +269,7 @@ Ask these questions:
 - [ ] 9 Go deeper
 - [ ] 10 Own window, popups in layers, settings
 - [ ] 11 Animation, frame pacing, profiler
-- [ ] 12 Resize, wide characters, encoding faults
+- [ ] 12 Resize, minimize, wide characters, encoding faults
+- [ ] 12b Links, fonts, pane keys
+- [ ] 12c Blur behind the window
 - [ ] 13 Install
