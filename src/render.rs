@@ -203,7 +203,13 @@ impl Gpu {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            // A frame with vsync waits about 8 ms in the present call, and the event loop waits with it. That delays the next key.
+            // Windows composes each window, so a window does not tear without vsync. bebo limits the frame rate itself.
+            // Set BEBO_VSYNC=1 to use vsync.
+            present_mode: [wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate]
+                .into_iter()
+                .find(|mode| caps.present_modes.contains(mode) && std::env::var_os("BEBO_VSYNC").is_none())
+                .unwrap_or(wgpu::PresentMode::Fifo),
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
             desired_maximum_frame_latency: 1,
@@ -407,6 +413,7 @@ impl Gpu {
 
     /// Shapes the row if it is not in the cache. Returns the cache key and the text width.
     fn shape(&mut self, row: &Row) -> (u64, f32) {
+        let start = std::time::Instant::now();
         let size = if row.size > 0.0 { row.size } else { self.font_px };
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         row.spans.hash(&mut hasher);
@@ -415,7 +422,9 @@ impl Gpu {
         row.fade.hash(&mut hasher);
         let key = hasher.finish();
         let frame_number = self.frame_number;
+        let mut missed = false;
         let entry = self.row_cache.entry(key).or_insert_with(|| {
+            missed = true;
             let mono = row.font == Font::Mono;
             let family = match row.font {
                 Font::Mono => self.mono.as_str(),
@@ -446,7 +455,11 @@ impl Gpu {
             (buffer, width, 0)
         });
         entry.2 = frame_number;
-        (key, entry.1)
+        let width = entry.1;
+        if missed {
+            prof::add("shape: new row", start);
+        }
+        (key, width)
     }
 
     /// Width in pixels of `text` in the interface font.
@@ -456,6 +469,7 @@ impl Gpu {
     }
 
     pub fn render(&mut self, frame: &Frame, background: [u8; 3]) {
+        let t0 = std::time::Instant::now();
         self.frame_number += 1;
         let (width, height) = self.size();
         self.viewport.update(&self.queue, Resolution { width: self.config.width, height: self.config.height });
@@ -550,6 +564,8 @@ impl Gpu {
             })
             .collect();
 
+        prof::add("render: text+vertices", t0);
+        let t1 = std::time::Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture) => texture,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
@@ -598,13 +614,64 @@ impl Gpu {
                 self.text[layer].render(&self.atlas, &self.viewport, &mut pass).expect("render text");
             }
         }
+        prof::add("render: wait for frame", t1);
+        let t2 = std::time::Instant::now();
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(surface_texture);
+        prof::add("render: submit+present", t2);
 
         // Keep only the rows that this frame used.
         let frame_number = self.frame_number;
-        self.row_cache.retain(|_, entry| entry.2 + 1 >= frame_number);
+        // Shaped rows stay for a later frame, for example after a scroll back. Above 1500 rows, only the rows of this frame stay.
+        // ponytail: one cleanup removes all old rows. Use an LRU order if the cleanup frame is slow.
+        if self.row_cache.len() > 1500 {
+            self.row_cache.retain(|_, entry| entry.2 + 1 >= frame_number);
+        }
         self.atlas.trim();
+    }
+}
+
+/// Built-in profiler. With BEBO_PROFILE set to a file path, bebo adds the time of each named step
+/// and writes a table to the file every second: count, total, mean, and maximum in microseconds.
+pub mod prof {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static DATA: Mutex<BTreeMap<&'static str, (u64, u64, u64)>> = Mutex::new(BTreeMap::new());
+
+    pub fn init() {
+        ON.store(std::env::var_os("BEBO_PROFILE").is_some(), Ordering::Relaxed);
+    }
+
+    /// Adds the time from `start` to now to the step `name`.
+    pub fn add(name: &'static str, start: Instant) {
+        if ON.load(Ordering::Relaxed) {
+            count(name, start.elapsed().as_micros() as u64);
+        }
+    }
+
+    /// Adds `value` to the step `name`, for a value that is not a time.
+    pub fn count(name: &'static str, value: u64) {
+        if ON.load(Ordering::Relaxed) {
+            let mut data = DATA.lock().unwrap();
+            let entry = data.entry(name).or_default();
+            entry.0 += 1;
+            entry.1 += value;
+            entry.2 = entry.2.max(value);
+        }
+    }
+
+    pub fn write() {
+        let Some(path) = std::env::var_os("BEBO_PROFILE") else { return };
+        let data = DATA.lock().unwrap();
+        let mut text = format!("{:<22} {:>9} {:>12} {:>9} {:>9}\n", "step", "count", "total", "mean", "max");
+        for (name, (n, total, max)) in data.iter() {
+            text += &format!("{name:<22} {n:>9} {total:>12} {:>9} {max:>9}\n", total / (*n).max(1));
+        }
+        let _ = std::fs::write(path, text);
     }
 }
 

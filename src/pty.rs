@@ -134,6 +134,7 @@ struct Tap {
 impl io::Read for Tap {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.pty.reader().read(buf)?;
+        crate::render::prof::count("pty: bytes per read", n as u64);
         let Tap { scan, proxy, .. } = self;
         scan.feed(&buf[..n], |mark| {
             let _ = proxy.proxy.send_event(UserEvent::Mark(proxy.id, mark));

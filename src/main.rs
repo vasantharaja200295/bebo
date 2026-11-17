@@ -679,6 +679,13 @@ struct App {
     last_frame: Instant,
     /// A shell has new output that is not on the screen.
     dirty: bool,
+    /// An animation needs the next frame.
+    anim_due: bool,
+    /// Time of the last write of the profile file.
+    last_profile: Instant,
+    /// Profiler: time of the last typed key, and the shell output after it came.
+    key_at: Option<Instant>,
+    echoed: bool,
     /// Time of the last key press of all types.
     last_input: Instant,
     /// The cell below the mouse: (pane, cell).
@@ -1999,6 +2006,9 @@ impl App {
             },
             None => bytes,
         };
+        // A frame is necessary only if the key changes the view. Else the echo of the shell draws the next frame.
+        // One frame less for each key: the frame waits for the screen refresh and delays the echo frame.
+        let view_changes = term.selection.is_some() || term.grid().display_offset() != 0;
         term.selection = None;
         term.scroll_display(Scroll::Bottom);
         drop(term);
@@ -2009,7 +2019,11 @@ impl App {
             }
         }
         let _ = pane.tx.send(Msg::Input(Cow::Owned(out)));
-        self.redraw();
+        self.key_at = Some(Instant::now());
+        self.echoed = false;
+        if view_changes {
+            self.redraw();
+        }
     }
 
     fn term_event(&mut self, id: usize, generation: u32, event: Event) {
@@ -2023,6 +2037,11 @@ impl App {
         let Some(pane) = self.panes.get_mut(&id) else { return };
         match event {
             Event::Wakeup => {
+                render::prof::count("term: wake-ups", 1);
+                if let (Some(key_at), false) = (self.key_at, self.echoed) {
+                    render::prof::add("latency: key to output", key_at);
+                }
+                self.echoed = self.key_at.is_some();
                 if pane.await_input {
                     pane.await_input = false;
                     let term = pane.term.lock();
@@ -2273,6 +2292,10 @@ impl ApplicationHandler<UserEvent> for App {
     /// Wakes up when a restart message must go away, or when a prompt needs a redraw after a resize.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
+        if std::env::var_os("BEBO_PROFILE").is_some() && now - self.last_profile > Duration::from_secs(1) {
+            self.last_profile = now;
+            render::prof::write();
+        }
         let mut next: Option<Instant> = None;
         let mut changed = false;
         for pane in self.panes.values_mut() {
@@ -2300,9 +2323,22 @@ impl ApplicationHandler<UserEvent> for App {
             self.redraw();
         }
         // Fast output gives thousands of wake-ups in a second. One frame for each 16 ms is sufficient.
-        if self.dirty {
-            let due = self.last_frame + Duration::from_millis(16);
+        // Animation frames: one for each refresh of the display at most.
+        if self.anim_due {
+            let hz = self.window.as_ref().and_then(|w| w.current_monitor()).and_then(|m| m.refresh_rate_millihertz()).unwrap_or(60_000);
+            let due = self.last_frame + Duration::from_micros(1_000_000_000 / hz.max(30_000) as u64);
             if due <= now {
+                self.anim_due = false;
+                self.redraw();
+            } else {
+                next = Some(next.map_or(due, |n| n.min(due)));
+            }
+        }
+        if self.dirty {
+            // After a key press, the echo of the shell shows immediately. The limit is for output that the user did not type.
+            let typing = now - self.last_input < Duration::from_millis(100);
+            let due = self.last_frame + Duration::from_millis(16);
+            if due <= now || typing {
                 self.dirty = false;
                 self.redraw();
             } else {
@@ -2513,6 +2549,7 @@ fn encode_key(key: &Key, text: Option<&str>, mods: ModifiersState, app_cursor: b
 
 fn main() {
     let start = Instant::now();
+    render::prof::init();
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
     // Start the GPU on a second thread now. It is the slowest step of the start.
@@ -2575,6 +2612,10 @@ fn main() {
         anim: Anim::default(),
         last_frame: start,
         dirty: false,
+        anim_due: false,
+        last_profile: start,
+        key_at: None,
+        echoed: false,
         last_input: start,
         hover_cell: None,
         hover_link: None,

@@ -118,6 +118,7 @@ impl Ui<'_> {
 
 impl App {
     pub(crate) fn draw(&mut self) {
+        let t0 = Instant::now();
         let m = self.metrics();
         let Some(mut gpu) = self.gpu.take() else { return };
         let t = self.theme;
@@ -225,12 +226,19 @@ impl App {
             ui.unpop();
         }
 
+        render::prof::add("draw: build frame", t0);
+        render::prof::count("draw: text rows", (frame.rows.len() + frame.top_rows.len()) as u64);
+        let t1 = Instant::now();
         gpu.render(&frame, t.bg);
+        render::prof::add("draw: total render", t1);
+        if let (Some(key_at), true) = (self.key_at, self.echoed) {
+            render::prof::add("latency: key to screen", key_at);
+            self.key_at = None;
+        }
         self.gpu = Some(gpu);
         self.hits = hits;
-        if anim.active {
-            self.redraw();
-        }
+        // The next animation frame comes from `about_to_wait`, with a limit on the frame rate.
+        self.anim_due = anim.active;
         self.anim = anim;
     }
 

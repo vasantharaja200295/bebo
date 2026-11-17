@@ -560,3 +560,33 @@ About 35 test runs with edge cases. No run stopped bebo: bad regex in find, find
 | A window could become too small for the title bar and the popups | The minimum window size is 420 x 240. |
 
 Not a bebo fault: a narrow pane with `ls` in Windows PowerShell 5.1 (section 15).
+
+## 18. Profile and speed (2026-11-17)
+
+bebo has a built-in profiler. Set `BEBO_PROFILE` to a file path. bebo then writes a table every second: each step, its count, total, mean, and maximum time in microseconds. It also counts the PTY read sizes, the wake-ups, and the time from a key to the screen. With the variable not set, the cost is one atomic read for each step.
+
+Measured on the test PC (GTX 1650, OpenGL), release build:
+
+| Case | Before | After |
+|---|---|---|
+| Key to screen, mean | 19.8 ms | 4.3 ms |
+| Key to screen, maximum | 29.9 ms | 18.0 ms |
+| Key to shell output, mean | 10.1 ms | 1.4 ms |
+| Frame time with present, mean | 9.6 ms | 2.8 ms |
+| CPU at idle, 5 s | 0 ms | 0 ms |
+| 200,000 lines with `cat.exe` | 1.9 s CPU, 244 frames | 2.0 s CPU, 231 frames |
+| Memory at idle | 83 MB | 74 MB |
+| First frame after start | 305 ms | 305 ms (not changed) |
+
+Changes:
+
+- **No vsync wait.** With vsync, each present call waited about 8 ms, and the event loop waited with it. Keys and shell output waited behind that frame. bebo now uses Mailbox or Immediate. Windows composes each window, so a window does not tear. `BEBO_VSYNC=1` selects vsync again.
+- **Own frame limits.** Shell output: one frame for each 16 ms. Animations: one frame for each refresh of the display. The echo of a typed key shows immediately.
+- **One frame less for each key.** A key that does not change the view (no selection, no scroll) draws no frame. The echo of the shell draws the next frame.
+- **Row cache.** Shaped rows stay in the cache until 1500 rows, so a scroll back does not shape the rows again.
+
+Not changed, with the reason:
+
+- The shell prompt shows at about 450 ms. That is the start time of Windows PowerShell 5.1 and the user profile, not bebo.
+- DirectX 12 has Mailbox mode, but its start is about 600 ms slower than OpenGL on this PC.
+- The large output time is the speed of the program that writes (see section 11).
