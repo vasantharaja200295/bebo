@@ -251,7 +251,8 @@ impl App {
         ui.rect(Rect { y: m.bar - 1.0, h: 1.0, ..bar }, mix(t.bar, t.border, 0.5), 255, 0.0);
         ui.hit(bar, Hit::TitleDrag);
 
-        let mut x = 10.0 * s;
+        // macOS draws its three window buttons at the left of the title bar.
+        let mut x = if platform::NATIVE_FRAME { 78.0 * s } else { 10.0 * s };
         ui.image(x - s, mid, 0, 16.0);
         x += 21.0 * s;
         ui.text(x, mid, "bebo", t.fg, Font::UiBold, 12.0, Align::Left);
@@ -262,7 +263,7 @@ impl App {
             x += 28.0 * s + ui.width("Administrator", Font::Ui, 11.0);
         }
 
-        let buttons = 3.0 * 46.0 * s;
+        let buttons = if platform::NATIVE_FRAME { 0.0 } else { 3.0 * 46.0 * s };
         let dim = mix(t.fg, t.dim, 0.4);
         let show_tabs = match self.settings.tab_bar {
             1 => true,
@@ -371,7 +372,8 @@ impl App {
 
         let maximized = self.window.as_ref().is_some_and(|w| w.is_maximized());
         let icons = [Icon::Minus, if maximized { Icon::Copy } else { Icon::Square }, Icon::X];
-        for (i, hit) in [Hit::WinMin, Hit::WinMax, Hit::WinClose].into_iter().enumerate() {
+        let own_buttons = if platform::NATIVE_FRAME { &[][..] } else { &[Hit::WinMin, Hit::WinMax, Hit::WinClose][..] };
+        for (i, hit) in own_buttons.iter().copied().enumerate() {
             let r = Rect { x: ui.w - (3 - i) as f32 * 46.0 * s, y: 0.0, w: 46.0 * s, h: m.bar - 1.0 };
             let hot = ui.hot(r);
             if hot {
@@ -403,11 +405,16 @@ impl App {
             ui.badge(row.x + 7.0 * s, mid, *profile);
             ui.text(row.x + 30.0 * s, mid, profile.name(), t.fg, Font::Ui, 12.0, Align::Left);
             ui.hit(row, Hit::MenuItem(i));
+            let keys = if cfg!(target_os = "macos") { format!("\u{21e7}\u{2318}{}", i + 1) } else { format!("Ctrl+Shift+{}", i + 1) };
+            if !platform::ADMIN {
+                ui.text(row.x + row.w - 8.0 * s, mid, &keys, t.dim, Font::Ui, 10.5, Align::Right);
+                continue;
+            }
             if shield_hot {
                 ui.rect(shield, mix(t.panel_hi, t.yellow, 0.25), 255, 4.0 * s);
                 ui.text(shield.x - 8.0 * s, mid, "As administrator", t.yellow, Font::Ui, 10.5, Align::Right);
             } else {
-                ui.text(shield.x - 8.0 * s, mid, &format!("Ctrl+Shift+{}", i + 1), t.dim, Font::Ui, 10.5, Align::Right);
+                ui.text(shield.x - 8.0 * s, mid, &keys, t.dim, Font::Ui, 10.5, Align::Right);
             }
             ui.icon(shield.x + shield.w / 2.0, mid, Icon::Shield, if shield_hot { t.yellow } else { t.dim }, 12.5);
             ui.hit(shield, Hit::MenuAdmin(i));
@@ -420,7 +427,7 @@ impl App {
         let mid = row.y + row_h / 2.0;
         ui.icon(row.x + 14.0 * s, mid, Icon::Settings, t.dim, 12.5);
         ui.text(row.x + 30.0 * s, mid, "Settings", t.fg, Font::Ui, 12.0, Align::Left);
-        ui.text(row.x + row.w - 8.0 * s, mid, "Ctrl+,", t.dim, Font::Ui, 10.5, Align::Right);
+        ui.text(row.x + row.w - 8.0 * s, mid, platform::keys("Ctrl+,"), t.dim, Font::Ui, 10.5, Align::Right);
         ui.hit(row, Hit::MenuItem(usize::MAX));
     }
 
@@ -476,7 +483,7 @@ impl App {
                 row("Prompt position", "Top: after the output. Bottom: at the pane edge.", Choice(1, vec!["Top", "Bottom"], self.bottom as usize)),
                 row("Command popup", "Where the colon popup opens", Choice(2, vec!["Auto", "Always below", "Always above"], st.popup as usize)),
                 row("Font", "All installed fonts. Fixed-width fonts are first.", Select(3, ui.gpu.mono().to_string())),
-                row("Font size", "8 to 32 px. Ctrl+= and Ctrl+- also change it.", Step(4, format!("{}", st.font_px))),
+                row("Font size", if cfg!(target_os = "macos") { "8 to 32 px. \u{2318}= and \u{2318}- also change it." } else { "8 to 32 px. Ctrl+= and Ctrl+- also change it." }, Step(4, format!("{}", st.font_px))),
                 row("Font weight", "400 is regular, 700 is bold. Bold text is 300 heavier.", Step(11, format!("{}", st.font_weight))),
                 row("Interface font", "Tabs, menus, and this page", Select(12, ui.gpu.ui().to_string())),
                 row("Cursor", "Shape of the caret on the prompt", Choice(5, vec!["Beam", "Block", "Underline"], st.cursor as usize)),
@@ -494,6 +501,8 @@ impl App {
                         Profile::PowerShell => "PowerShell 5.1",
                         Profile::Cmd => "Command Prompt",
                         Profile::Wsl => "WSL",
+                        Profile::Zsh => "zsh",
+                        Profile::Bash => "bash",
                     })
                     .collect();
                 let default = st.profile.unwrap_or_else(Profile::default_profile);

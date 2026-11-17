@@ -692,3 +692,26 @@ Each text color of both themes now has a contrast of at least 4.5:1 (WCAG AA) on
 | Light | Red, yellow, green, cyan, blue (ANSI) | 2.5 to 4.0 | 4.6 |
 
 Black and white (ANSI 0, 7, 15) do not change: programs also use them as background colors.
+
+## 24. macOS (2026-11-17)
+
+bebo builds for macOS 11 or later, for Apple Silicon and Intel. `src/platform.rs` has the parts that are different on each system.
+
+| Part | Windows | macOS |
+|---|---|---|
+| GPU | OpenGL (DirectX 12 with `BEBO_BACKEND=dx12`) | Metal |
+| PTY | ConPTY | Unix PTY |
+| Shells | PowerShell 7, Windows PowerShell, Command Prompt, WSL | zsh, bash, PowerShell 7 |
+| Shell marks | `bebo.ps1` | `bebo.zsh` (as `.zshenv` through ZDOTDIR), `bebo.bash` (as `--rcfile`) |
+| Window frame | bebo draws the buttons and resizes at the edges | the system draws the buttons and resizes; the title bar is transparent |
+| Command key | Ctrl (and Ctrl+Shift) | Command; Control and Option go to the shell |
+| Fonts at the start | a short list of files | all system fonts |
+| Open a link | `explorer.exe` | `open` (`open -R` shows a program file) |
+| Settings | `%APPDATA%\bebo` | `~/Library/Application Support/bebo` |
+| Administrator tabs | yes | no |
+| Package | Inno Setup wizard | `bebo.app` in a disk image, signed ad hoc |
+
+- Checks on the Windows PC: `cargo check` for `aarch64-apple-darwin` and `x86_64-apple-darwin`, also for the tests, with no errors and no warnings. The Windows build and its tests did not change.
+- The GitHub Actions workflow `macOS` runs the tests on a Mac, builds `bebo.app`, and keeps the disk image as an artifact.
+- Not tested on a real Mac: the window, the keys, the zsh and bash marks, and the fonts. Test these on a Mac before you give the app to other people.
+- The app has no Developer ID signature and is not notarized. macOS stops the first start; the user opens it from System Settings > Privacy & Security. Notarization needs a paid Apple Developer account.

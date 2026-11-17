@@ -226,6 +226,15 @@ Test: idle CPU must be zero. A key must show on the screen in less than one fram
 7. **Pane keys**: move the focus to the pane on the left, right, top, or bottom with the keyboard. Of the panes on that side, select the nearest pane, then the pane nearest to the middle of the current pane. Send the keys to the shell when the tab has only one pane.
 8. **Contrast**: write a function that gives the WCAG contrast ratio of two colors. Check each text color of each theme against the background and against a selected row. Raise each color below 4.5:1: mix it toward white in a dark theme, or toward black in a light theme, in small steps until it passes. Think about why the hue then stays the same. Leave black and white as they are, and find out why. Write a unit test for the rule, so that a later color change cannot break it.
 
+### Stage 12c: A second system (macOS)
+
+1. List each call that exists only on Windows: the registry, GDI, the window frame, the font paths, the programs that open a file. Put each one in one module with a Windows version and a macOS version.
+2. Use the target of the build script, not `cfg!(windows)`, in `build.rs`. Think about why: the build script runs on the build PC.
+3. Type-check the macOS version on Windows with `cargo check --target aarch64-apple-darwin`. It finds most mistakes, but it does not link or run the program.
+4. Write the shell integration for zsh and bash: the same OSC 133 marks as the PowerShell script. Find out how to load your zsh file first and still load the files of the user (ZDOTDIR).
+5. Use the Command key for the terminal commands on macOS, and send Control and Option to the shell. Think about why Ctrl+C and Ctrl+K must not be terminal commands there.
+6. Make an app bundle: `Info.plist`, the program, and an icon. Sign it ad hoc, and put it in a disk image. Build it on a Mac in CI.
+
 ### Stage 13: Install
 
 1. Embed the icon in the program file with a build script.
@@ -266,4 +275,5 @@ Ask these questions:
 - [ ] 11 Animation, frame pacing, profiler
 - [ ] 12 Resize, minimize, wide characters, encoding faults
 - [ ] 12b Links, fonts, pane keys, contrast
+- [ ] 12c macOS
 - [ ] 13 Install

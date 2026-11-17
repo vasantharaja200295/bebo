@@ -1,0 +1,25 @@
+# Builds and tests bebo on a Mac, and keeps bebo.app in a disk image as a build artifact.
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Test
+        run: cargo test --release
+      - name: Build the app and the disk image
+        run: bash installer/macos/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bebo-macos
+          path: dist/*.dmg

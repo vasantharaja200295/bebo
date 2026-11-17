@@ -136,7 +136,9 @@ pub fn init_device(t0: std::time::Instant) -> Device {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     // OpenGL is the default: on the test PC it starts in about 250 ms and uses about 90 MB.
     // DirectX 12 needs about 600 ms and 160 MB, because wgpu examines each adapter. Set BEBO_BACKEND=dx12 to use it.
+    // macOS has only Metal.
     descriptor.backends = match std::env::var("BEBO_BACKEND").as_deref() {
+        _ if cfg!(target_os = "macos") => wgpu::Backends::METAL,
         Ok("dx12") => wgpu::Backends::DX12,
         _ => wgpu::Backends::GL,
     };
@@ -260,23 +262,29 @@ impl Gpu {
         let vertex_capacity = 256 * 1024;
         let vertices = Self::vertex_buffer(&device, vertex_capacity);
 
-        // Load only the fonts that bebo uses. A scan of all system fonts is slow.
         let mut db = fontdb::Database::new();
-        let user_fonts = std::env::var("LOCALAPPDATA").unwrap_or_default() + r"\Microsoft\Windows\Fonts\";
-        // Medium is for the prompt rows, which are 50 heavier than regular.
-        for file in ["JetBrainsMonoNL-Regular.ttf", "JetBrainsMonoNL-Medium.ttf", "JetBrainsMonoNL-Bold.ttf", "JetBrainsMonoNL-Italic.ttf"] {
-            if db.load_font_file(format!("{user_fonts}{file}")).is_err() {
+        if cfg!(windows) {
+            // Windows: load only the fonts that bebo uses. A scan of all system fonts is slow.
+            let user_fonts = std::env::var("LOCALAPPDATA").unwrap_or_default() + r"\Microsoft\Windows\Fonts\";
+            // Medium is for the prompt rows, which are 50 heavier than regular.
+            for file in ["JetBrainsMonoNL-Regular.ttf", "JetBrainsMonoNL-Medium.ttf", "JetBrainsMonoNL-Bold.ttf", "JetBrainsMonoNL-Italic.ttf"] {
+                if db.load_font_file(format!("{user_fonts}{file}")).is_err() {
+                    let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
+                }
+            }
+            let system = [
+                "CascadiaMono.ttf", "consola.ttf", "consolab.ttf", "segoeui.ttf", "seguisb.ttf", "seguisym.ttf",
+                "seguiemj.ttf",
+                // Fallback fonts for Chinese, Japanese, Korean, and Indian scripts. fontdb maps the files and reads only the parts in use.
+                "msyh.ttc", "YuGothR.ttc", "malgun.ttf", "Nirmala.ttc",
+            ];
+            for file in system {
                 let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
             }
-        }
-        let system = [
-            "CascadiaMono.ttf", "consola.ttf", "consolab.ttf", "segoeui.ttf", "seguisb.ttf", "seguisym.ttf",
-            "seguiemj.ttf",
-            // Fallback fonts for Chinese, Japanese, Korean, and Indian scripts. fontdb maps the files and reads only the parts in use.
-            "msyh.ttc", "YuGothR.ttc", "malgun.ttf", "Nirmala.ttc",
-        ];
-        for file in system {
-            let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
+        } else {
+            // macOS: the fonts of the system are in many files, and the fallback fonts (emoji, CJK, symbols) are among them.
+            // ponytail: this reads all system fonts at the start. Load a short list, as on Windows, if the start is slow.
+            db.load_system_fonts();
         }
         db.load_font_source(fontdb::Source::Binary(Arc::new(lucide_icons::LUCIDE_FONT_BYTES)));
         // Geist is the interface font. The two weights are inside bebo.exe (Open Font License, see assets/fonts/OFL.txt).
@@ -284,7 +292,8 @@ impl Gpu {
         db.load_font_source(fontdb::Source::Binary(Arc::new(include_bytes!("../assets/fonts/Geist-Regular.ttf"))));
         db.load_font_source(fontdb::Source::Binary(Arc::new(include_bytes!("../assets/fonts/Geist-SemiBold.ttf"))));
         let has = |name: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
-        let mono = ["JetBrains Mono NL", "Cascadia Mono", "Consolas"].into_iter().find(|n| has(n)).unwrap_or("Consolas").to_string();
+        let fallback = if cfg!(target_os = "macos") { "Menlo" } else { "Consolas" };
+        let mono = ["JetBrains Mono NL", "Cascadia Mono", "SF Mono", "Menlo", "Consolas"].into_iter().find(|n| has(n)).unwrap_or(fallback).to_string();
         let ui = "Geist".to_string();
         let font_system = FontSystem::new_with_locale_and_db("en-US".into(), db);
         tick(t0, "fonts");
@@ -364,7 +373,10 @@ impl Gpu {
     pub fn families(&mut self) -> &[(String, bool)] {
         if self.families.is_empty() {
             let db = self.font_system.db_mut();
-            db.load_system_fonts();
+            // macOS loads the system fonts at the start.
+            if !cfg!(target_os = "macos") {
+                db.load_system_fonts();
+            }
             let mut list: Vec<(String, bool)> =
                 db.faces().filter_map(|f| f.families.first().map(|(n, _)| (n.clone(), f.monospaced))).collect();
             list.retain(|(n, _)| n != "lucide");

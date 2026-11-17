@@ -1,0 +1,4 @@
+# Shell scripts must keep LF line endings, also when Windows checks them out.
+*.sh text eol=lf
+*.zsh text eol=lf
+*.bash text eol=lf

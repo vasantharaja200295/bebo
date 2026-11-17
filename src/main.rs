@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //! bebo: a GPU terminal emulator. See docs/PLAN.md.
 
+mod platform;
 mod pty;
 mod render;
 mod theme;
@@ -27,6 +28,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+#[cfg(windows)]
 use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
 use winit::window::{CursorIcon, Icon, ResizeDirection, Window, WindowId};
 
@@ -375,7 +377,7 @@ fn colon_items(text: &str) -> Vec<(String, &'static str, &'static str)> {
         let hint = if name.trim().is_empty() { "Type the new name. Enter with no name removes the name." } else { "Enter gives this name to the tab" };
         return vec![(":rename".to_string(), hint, "")];
     }
-    COLON.iter().filter(|(n, ..)| n.starts_with(text)).map(|(n, d, k, _)| (format!(":{n}"), *d, *k)).collect()
+    COLON.iter().filter(|(n, ..)| n.starts_with(text)).map(|(n, d, k, _)| (format!(":{n}"), *d, platform::keys(k))).collect()
 }
 
 /// Positions of the characters of `query` in `text`, in order. `None` if there is no match.
@@ -629,25 +631,15 @@ impl Settings {
     fn theme(&self) -> Theme {
         match self.theme {
             1 => theme::ONE_LIGHT,
-            2 if !system_dark() => theme::ONE_LIGHT,
+            2 if !platform::system_dark() => theme::ONE_LIGHT,
             _ => theme::ONE_DARK,
         }
     }
 }
 
-/// Folder of `settings.txt`: `%APPDATA%\bebo`, or the folder in `BEBO_CONFIG`.
+/// Folder of `settings.txt`: `%APPDATA%\bebo` or `~/Library/Application Support/bebo`, or the folder in `BEBO_CONFIG`.
 fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("BEBO_CONFIG").map(PathBuf::from).or_else(|| std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("bebo")))
-}
-
-/// `true` if Windows uses the dark mode for apps.
-fn system_dark() -> bool {
-    use winreg::RegKey;
-    use winreg::enums::HKEY_CURRENT_USER;
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        .and_then(|key| key.get_value::<u32, _>("AppsUseLightTheme"))
-        .map_or(true, |light| light == 0)
+    std::env::var_os("BEBO_CONFIG").map(PathBuf::from).or_else(|| platform::app_data().map(|d| d.join("bebo")))
 }
 
 struct App {
@@ -792,7 +784,7 @@ impl App {
     fn new_tab(&mut self, profile: Option<Profile>) {
         // A new tab starts in the home folder. The first tab starts in the folder of the bebo process.
         // A split keeps the folder of its pane: see `split`.
-        let cwd = if self.tabs.is_empty() { None } else { std::env::var_os("USERPROFILE").map(PathBuf::from) };
+        let cwd = if self.tabs.is_empty() { None } else { platform::home() };
         let profile = profile.or(self.focus_pane().map(|p| p.profile)).unwrap_or_else(Profile::default_profile);
         let size = self.focus_pane().map_or((100, 30), |p| (p.cols, p.rows));
         let id = self.new_pane(cwd, profile, size);
@@ -897,12 +889,12 @@ impl App {
         // The content is also lost if the folder does not exist now.
         let lost = clean || !pane.cwd.as_ref().is_some_and(|p| p.is_dir());
         if lost {
-            pane.cwd = std::env::var_os("USERPROFILE").map(PathBuf::from);
+            pane.cwd = platform::home();
             pane.blocks.clear();
         }
         let line = "\u{2500}".repeat(6);
         let state = if lost { "content lost" } else { "content restored" };
-        let banner = format!("{line} Session restarted \u{b7} {} \u{b7} {state} {line}", clock());
+        let banner = format!("{line} Session restarted \u{b7} {} \u{b7} {state} {line}", platform::clock());
         let color = if lost { "33" } else { "90" };
         let powershell = matches!(pane.profile, Profile::Pwsh | Profile::PowerShell);
         {
@@ -1085,7 +1077,7 @@ impl App {
     /// Direction of a window resize if the mouse is on the window edge.
     fn resize_edge(&self) -> Option<ResizeDirection> {
         let window = self.window.as_ref()?;
-        if window.is_maximized() {
+        if window.is_maximized() || platform::NATIVE_FRAME {
             return None;
         }
         let size = window.inner_size();
@@ -1142,7 +1134,7 @@ impl App {
         let Some((id, rect)) = self.pane_at(x, y) else { return };
         self.tabs[self.active].focus = id;
         let Some((point, side)) = self.cell_at(id, rect, x, y) else { return };
-        if self.mods.control_key() && self.settings.links && self.open_link(id, point) {
+        if self.link_key() && self.settings.links && self.open_link(id, point) {
             return;
         }
 
@@ -1328,7 +1320,7 @@ impl App {
                 (None, None, Some(i)) if self.dividers[i].side_by_side => CursorIcon::ColResize,
                 (None, None, Some(_)) => CursorIcon::RowResize,
                 // A click opens a link. In a program that gets the mouse (vim, less), only Ctrl+click opens it.
-                (None, None, None) if self.hover_link.is_some_and(|(id, ..)| self.mods.control_key() || !self.mouse_reported(id)) => {
+                (None, None, None) if self.hover_link.is_some_and(|(id, ..)| self.link_key() || !self.mouse_reported(id)) => {
                     CursorIcon::Pointer
                 },
                 (None, None, None) => CursorIcon::Text,
@@ -1564,17 +1556,11 @@ impl App {
     /// Opens the URL or the file path at `point`. Returns `false` if there is no link.
     fn open_link(&self, id: usize, point: Point) -> bool {
         let Some((target, ..)) = self.link_at(id, point) else { return false };
-        // A program or a script does not start from a click. Explorer shows the file.
-        let risky = ["exe", "bat", "cmd", "com", "ps1", "msi", "vbs", "js", "lnk", "scr"];
+        // A program or a script does not start from a click. The file manager shows the file.
+        let risky = ["exe", "bat", "cmd", "com", "ps1", "msi", "vbs", "js", "lnk", "scr", "app", "command", "sh", "pkg"];
         let extension = std::path::Path::new(&target).extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
         let is_url = target.starts_with("http");
-        let mut command = std::process::Command::new("explorer.exe");
-        if !is_url && extension.is_some_and(|e| risky.contains(&e.as_str())) {
-            command.arg(format!("/select,{target}"));
-        } else {
-            command.arg(&target);
-        }
-        command.spawn().is_ok()
+        platform::open(&target, !is_url && extension.is_some_and(|e| risky.contains(&e.as_str())))
     }
 
     /// `font_px` is in physical pixels.
@@ -1595,7 +1581,7 @@ impl App {
 
     /// The list of the palette.
     fn entries(&self) -> Vec<Entry> {
-        let entry = |category, title: &str, keys, cmd| Entry { category, title: title.to_string(), keys, cmd, current: false };
+        let entry = |category, title: &str, keys, cmd| Entry { category, title: title.to_string(), keys: platform::keys(keys), cmd, current: false };
         let mut list = vec![
             entry("Tab", "New tab", "Ctrl+Shift+T", Cmd::NewTab),
             entry("Tab", "Rename tab...", "", Cmd::RenameTab),
@@ -1625,7 +1611,7 @@ impl App {
         for profile in &self.profiles {
             list.push(entry("Profile", &format!("Open {}", profile.name()), "", Cmd::Profile(*profile)));
         }
-        for profile in &self.profiles {
+        for profile in self.profiles.iter().filter(|_| platform::ADMIN) {
             list.push(entry("Admin", &format!("Open {} as administrator", profile.name()), "", Cmd::Admin(*profile)));
         }
         list
@@ -1969,6 +1955,15 @@ impl App {
         // A full-screen program (nano, vim) gets Ctrl+K.
         let full_screen = self.focus_pane().is_some_and(|p| p.term.lock().mode().contains(TermMode::ALT_SCREEN));
 
+        // macOS: the Command key gives the bebo commands. Control and Option go to the shell,
+        // so only Control+Tab and the Shift+Page keys stay bebo commands below.
+        #[cfg(target_os = "macos")]
+        if self.mods.super_key() {
+            self.mac_command(&character, code, shift, alt, has_selection, font_px);
+            return;
+        }
+        let (ctrl, alt) = if cfg!(target_os = "macos") { (false, false) } else { (ctrl, alt) };
+
         // bebo commands.
         match (ctrl, shift, alt, character.as_str(), &key) {
             (true, true, false, "t", _) => self.run(Cmd::NewTab),
@@ -2007,11 +2002,7 @@ impl App {
             (true, false, false, "0", _) => self.set_font(FONT_PX * self.scale),
             (true, false, false, ",", _) => self.run(Cmd::Settings),
             (true, false, false, "k", _) if !full_screen => self.run(Cmd::Clear),
-            (true, _, false, _, Key::Named(NamedKey::Tab)) => {
-                let n = self.tabs.len();
-                self.active = if shift { (self.active + n - 1) % n } else { (self.active + 1) % n };
-                self.relayout();
-            },
+            (_, _, false, _, Key::Named(NamedKey::Tab)) if self.mods.control_key() => self.step_tab(!shift),
             (false, true, false, _, Key::Named(NamedKey::PageUp | NamedKey::PageDown)) => {
                 let scroll = if key == Key::Named(NamedKey::PageUp) { Scroll::PageUp } else { Scroll::PageDown };
                 if let Some(pane) = self.focus_pane() {
@@ -2022,16 +2013,6 @@ impl App {
             (true, true, false, _, Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown)) => {
                 self.jump_prompt(key == Key::Named(NamedKey::ArrowUp));
             },
-            (false, false, true, _, Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowUp | NamedKey::ArrowRight | NamedKey::ArrowDown)) => {
-                // ponytail: focus moves in tree order, not by direction on the screen.
-                let mut leaves = Vec::new();
-                self.tabs[self.active].root.leaves(&mut leaves);
-                let n = leaves.len();
-                let i = leaves.iter().position(|l| *l == focus).unwrap_or(0);
-                let back = matches!(key, Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowUp));
-                self.tabs[self.active].focus = leaves[if back { (i + n - 1) % n } else { (i + 1) % n }];
-                self.relayout();
-            },
             _ if in_settings => {},
             _ => {
                 if !self.colon_key(&key, event.text.as_deref()) {
@@ -2039,6 +2020,63 @@ impl App {
                 }
             },
         }
+    }
+
+    /// Selects the next tab, or the tab before it.
+    fn step_tab(&mut self, next: bool) {
+        let n = self.tabs.len();
+        self.active = if next { (self.active + 1) % n } else { (self.active + n - 1) % n };
+        self.relayout();
+    }
+
+    /// The bebo commands with the Command key on macOS, with the keys of other macOS terminals.
+    /// A Command key that is not a command does nothing: the shell must not get it as text.
+    #[cfg(target_os = "macos")]
+    fn mac_command(&mut self, character: &str, code: Option<KeyCode>, shift: bool, alt: bool, has_selection: bool, font_px: f32) {
+        let arrows = [KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::ArrowUp, KeyCode::ArrowDown];
+        let arrow = arrows.iter().position(|c| Some(*c) == code);
+        let digit = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4].iter().position(|c| Some(*c) == code);
+        match (character, shift, alt) {
+            (_, _, true) if arrow.is_some() => {
+                if self.pane_rects.len() > 1 {
+                    self.run(Cmd::FocusPane(arrow.unwrap_or(0) as u8));
+                }
+            },
+            (_, false, false) if matches!(arrow, Some(2 | 3)) => self.jump_prompt(arrow == Some(2)),
+            (_, true, _) if digit.is_some() => {
+                if let Some(profile) = digit.and_then(|i| self.profiles.get(i)).copied() {
+                    self.new_tab(Some(profile));
+                }
+            },
+            ("t", ..) => self.run(Cmd::NewTab),
+            ("w", ..) => self.run(Cmd::ClosePane),
+            ("r", ..) => self.run(Cmd::Restart),
+            ("f", ..) => self.run(Cmd::Find),
+            ("p", ..) => self.run(Cmd::Palette),
+            ("c", ..) if has_selection => {
+                self.copy();
+                if let Some(pane) = self.focus_pane() {
+                    pane.term.lock().selection = None;
+                }
+                self.redraw();
+            },
+            ("v", ..) => self.paste(),
+            ("k", ..) => self.run(Cmd::Clear),
+            (",", ..) => self.run(Cmd::Settings),
+            ("d", false, _) => self.run(Cmd::SplitRight),
+            ("d", true, _) => self.run(Cmd::SplitDown),
+            ("=" | "+", ..) => self.set_font(font_px + 1.0),
+            ("-", ..) => self.set_font(font_px - 1.0),
+            ("0", ..) => self.set_font(FONT_PX * self.scale),
+            ("]" | "}", true, _) => self.step_tab(true),
+            ("[" | "{", true, _) => self.step_tab(false),
+            _ => {},
+        }
+    }
+
+    /// The key for a link click in a program that gets the mouse: Ctrl on Windows, Command on macOS.
+    fn link_key(&self) -> bool {
+        if cfg!(target_os = "macos") { self.mods.super_key() } else { self.mods.control_key() }
     }
 
     /// Sends a key to the shell. If a selection is in the command line, a text key replaces it.
@@ -2252,6 +2290,12 @@ impl App {
     }
 
     /// Starts a new bebo window as administrator with this shell. Windows asks the user first.
+    /// macOS has no such action (`platform::ADMIN` hides it).
+    #[cfg(not(windows))]
+    fn open_admin(&self, _profile: Profile) {}
+
+    /// Starts a new bebo window as administrator with this shell. Windows asks the user first.
+    #[cfg(windows)]
     fn open_admin(&self, profile: Profile) {
         use std::os::windows::ffi::OsStrExt;
         let wide = |text: &std::ffi::OsStr| text.encode_wide().chain(Some(0)).collect::<Vec<u16>>();
@@ -2279,21 +2323,27 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        // bebo draws its own title bar. The shadow keeps the border and the rounded corners of Windows 11.
         let attributes = Window::default_attributes()
             .with_title("bebo")
             .with_inner_size(LogicalSize::new(1000.0, 610.0))
             // Below this size, the title bar and the popups have no room.
             .with_min_inner_size(LogicalSize::new(420.0, 240.0))
-            .with_decorations(false)
             // A test window does not take the keyboard focus from the user.
             .with_active(std::env::var_os("BEBO_TEST").is_none())
-            .with_window_icon(self.icon.clone())
-            .with_taskbar_icon(self.icon.clone())
-            .with_undecorated_shadow(true);
+            .with_window_icon(self.icon.clone());
+        // Windows: bebo draws its own title bar. The shadow keeps the border and the rounded corners of Windows 11.
+        #[cfg(windows)]
+        let attributes = attributes.with_decorations(false).with_taskbar_icon(self.icon.clone()).with_undecorated_shadow(true);
+        // macOS: the window keeps its frame, so that macOS draws the window buttons and resizes the window at its edges.
+        // The title bar is transparent, and bebo draws its tabs below the window buttons.
+        #[cfg(target_os = "macos")]
+        let attributes = {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attributes.with_titlebar_transparent(true).with_fullsize_content_view(true).with_title_hidden(true)
+        };
         let window = Arc::new(event_loop.create_window(attributes).expect("create window"));
         // The window shows immediately with the background color. The GPU frame comes when the device is ready.
-        paint_background(&window, self.theme.bg);
+        platform::paint_background(&window, self.theme.bg);
         self.window = Some(window);
         render::tick(self.start, "window");
         self.start_gpu();
@@ -2330,7 +2380,7 @@ impl ApplicationHandler<UserEvent> for App {
             },
             WindowEvent::RedrawRequested if self.gpu.is_none() => {
                 if let Some(window) = &self.window {
-                    paint_background(window, self.theme.bg);
+                    platform::paint_background(window, self.theme.bg);
                 }
             },
             WindowEvent::RedrawRequested => self.draw(),
@@ -2486,38 +2536,6 @@ fn parent_split(node: &Node, id: usize) -> Option<bool> {
     }
 }
 
-/// Local time as "07:51 AM".
-fn clock() -> String {
-    // SAFETY: SYSTEMTIME is plain data, and GetLocalTime fills all of it.
-    let time = unsafe {
-        let mut time = std::mem::zeroed();
-        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut time);
-        time
-    };
-    let hour = if time.wHour % 12 == 0 { 12 } else { time.wHour % 12 };
-    format!("{hour:02}:{:02} {}", time.wMinute, if time.wHour < 12 { "AM" } else { "PM" })
-}
-
-/// Fills the window with the background color through GDI. bebo uses this before the GPU is ready.
-fn paint_background(window: &Window, color: Rgb) {
-    use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, GetDC, ReleaseDC};
-    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    let Ok(handle) = window.window_handle() else { return };
-    let RawWindowHandle::Win32(handle) = handle.as_raw() else { return };
-    let hwnd = handle.hwnd.get() as *mut core::ffi::c_void;
-    let size = window.inner_size();
-    let rect = RECT { left: 0, top: 0, right: size.width as i32, bottom: size.height as i32 };
-    // SAFETY: `hwnd` is the handle of a window that is alive. The DC and the brush are released here.
-    unsafe {
-        let dc = GetDC(hwnd);
-        let brush = CreateSolidBrush(color[0] as u32 | (color[1] as u32) << 8 | (color[2] as u32) << 16);
-        FillRect(dc, &rect, brush);
-        DeleteObject(brush);
-        ReleaseDC(hwnd, dc);
-    }
-}
 
 /// Start and end of the word at `index`. A space, a quote, or a bracket ends the word.
 fn token_range(chars: &[char], index: usize) -> Option<(usize, usize)> {
@@ -2752,9 +2770,11 @@ fn main() {
         hover_cell: None,
         hover_link: None,
         // The program file has two icons: 1 for the dark mode of Windows and 2 for the light mode. See build.rs.
-        icon: Icon::from_resource(if system_dark() { 1 } else { 2 }, None).ok(),
-        // SAFETY: the function has no arguments and only reads the token of this process.
-        admin: unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 },
+        #[cfg(windows)]
+        icon: Icon::from_resource(if platform::system_dark() { 1 } else { 2 }, None).ok(),
+        #[cfg(not(windows))]
+        icon: None,
+        admin: platform::is_admin(),
     };
     render::tick(start, "event loop");
     // Start the shell before the window and the GPU. The shell starts while the GPU starts.

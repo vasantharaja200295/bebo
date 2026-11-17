@@ -1,4 +1,4 @@
-//! Shell process, ConPTY, shell integration marks, and a new environment for each shell.
+//! Shell process, PTY (ConPTY on Windows), shell integration marks, and a new environment for each shell.
 
 use std::collections::HashMap;
 use std::io;
@@ -176,17 +176,23 @@ impl OnResize for Tap {
     }
 }
 
-/// A shell that bebo can start.
+/// A shell that bebo can start. Command Prompt and WSL exist only on Windows.
 #[derive(Clone, Copy, PartialEq, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum Profile {
     Pwsh,
     PowerShell,
     Cmd,
     Wsl,
+    Zsh,
+    Bash,
 }
 
 impl Profile {
+    #[cfg(windows)]
     pub const ALL: [Profile; 4] = [Profile::Pwsh, Profile::PowerShell, Profile::Cmd, Profile::Wsl];
+    #[cfg(not(windows))]
+    pub const ALL: [Profile; 3] = [Profile::Zsh, Profile::Bash, Profile::Pwsh];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -194,6 +200,8 @@ impl Profile {
             Profile::PowerShell => "Windows PowerShell 5.1",
             Profile::Cmd => "Command Prompt",
             Profile::Wsl => "WSL",
+            Profile::Zsh => "zsh",
+            Profile::Bash => "bash",
         }
     }
 
@@ -204,6 +212,8 @@ impl Profile {
             Profile::PowerShell => "Windows PowerShell",
             Profile::Cmd => "Command Prompt",
             Profile::Wsl => "WSL",
+            Profile::Zsh => "zsh",
+            Profile::Bash => "bash",
         }
     }
 
@@ -211,17 +221,20 @@ impl Profile {
     pub fn image(self) -> u16 {
         match self {
             Profile::Pwsh | Profile::PowerShell => 1,
-            Profile::Cmd => 2,
+            Profile::Cmd | Profile::Zsh | Profile::Bash => 2,
             Profile::Wsl => 3,
         }
     }
 
     pub fn program(self) -> &'static str {
         match self {
-            Profile::Pwsh => "pwsh.exe",
+            Profile::Pwsh if cfg!(windows) => "pwsh.exe",
+            Profile::Pwsh => "pwsh",
             Profile::PowerShell => "powershell.exe",
             Profile::Cmd => "cmd.exe",
             Profile::Wsl => "wsl.exe",
+            Profile::Zsh => "zsh",
+            Profile::Bash => "bash",
         }
     }
 
@@ -231,14 +244,18 @@ impl Profile {
         Profile::ALL.into_iter().filter(|p| find_program(&path, p.program()).is_some()).collect()
     }
 
-    /// PowerShell 7 if it is installed. If not, Windows PowerShell.
+    /// Windows: PowerShell 7 if it is installed. If not, Windows PowerShell.
+    /// macOS: the login shell of the user ($SHELL), or zsh.
     pub fn default_profile() -> Profile {
         let path = std::env::var("PATH").unwrap_or_default();
-        if find_program(&path, "pwsh.exe").is_some() { Profile::Pwsh } else { Profile::PowerShell }
+        if cfg!(windows) {
+            return if find_program(&path, "pwsh.exe").is_some() { Profile::Pwsh } else { Profile::PowerShell };
+        }
+        if std::env::var("SHELL").is_ok_and(|shell| shell.ends_with("/bash")) { Profile::Bash } else { Profile::Zsh }
     }
 }
 
-/// Starts a shell on a new ConPTY. The shell writes into `term`.
+/// Starts a shell on a new PTY. The shell writes into `term`.
 /// `banner` is "SGR code|text". The PowerShell script prints it above the first prompt.
 pub fn spawn_shell(
     term: SharedTerm,
@@ -262,6 +279,23 @@ pub fn spawn_shell(
     let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("path")).map(|(_, v)| v.clone()).unwrap_or_default();
     let program = find_program(&path, profile.program()).unwrap_or_else(|| profile.program().to_string());
     let args = match profile {
+        // zsh reads `.zshenv` from ZDOTDIR first. bebo's file there puts ZDOTDIR back and adds the marks.
+        Profile::Zsh => {
+            let dir = integration_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(".zshenv"), include_str!("shell/bebo.zsh"));
+            if let Some(user) = env.get("ZDOTDIR").cloned() {
+                env.insert("BEBO_ZDOTDIR".into(), user);
+            }
+            env.insert("ZDOTDIR".into(), dir.to_string_lossy().into_owned());
+            vec!["-l".to_string()]
+        },
+        Profile::Bash => {
+            let file = integration_dir().join("bebo.bash");
+            let _ = std::fs::create_dir_all(integration_dir());
+            let _ = std::fs::write(&file, include_str!("shell/bebo.bash"));
+            vec!["--rcfile".to_string(), file.to_string_lossy().into_owned(), "-i".to_string()]
+        },
         Profile::Pwsh | Profile::PowerShell => {
             // The script has no double quotes and no comments in the code part, so one line is safe.
             let script: String = include_str!("shell/bebo.ps1")
@@ -279,6 +313,7 @@ pub fn spawn_shell(
         working_directory: cwd.filter(|p| p.is_dir()),
         drain_on_exit: false,
         env,
+        #[cfg(windows)]
         escape_args: true,
     };
     let pty = tty::new(&options, size, 0)?;
@@ -289,15 +324,32 @@ pub fn spawn_shell(
     Ok(tx)
 }
 
+/// The folder of the zsh and bash integration files. bebo writes them at each shell start.
+fn integration_dir() -> PathBuf {
+    std::env::temp_dir().join("bebo-shell")
+}
+
 fn find_program(path: &str, program: &str) -> Option<String> {
-    path.split(';')
+    path.split(if cfg!(windows) { ';' } else { ':' })
         .map(|dir| PathBuf::from(dir.trim()).join(program))
         .find(|p| p.is_file())
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The environment of bebo, with the values that a terminal sets. A Mac app often has no language setting.
+#[cfg(not(windows))]
+fn fresh_env() -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = std::env::vars().collect();
+    env.insert("TERM".into(), "xterm-256color".into());
+    if !env.contains_key("LANG") && !env.contains_key("LC_ALL") {
+        env.insert("LANG".into(), "en_US.UTF-8".into());
+    }
+    env
+}
+
 /// Reads the environment variables from the registry.
 /// A new shell then sees a `PATH` that an installer changed after bebo started.
+#[cfg(windows)]
 fn fresh_env() -> HashMap<String, String> {
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
@@ -345,6 +397,7 @@ fn fresh_env() -> HashMap<String, String> {
 }
 
 /// Replaces `%NAME%` with the value from `lookup`. An unknown name stays as it is.
+#[cfg(windows)]
 fn expand(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::new();
     let mut rest = value;
@@ -390,6 +443,7 @@ mod tests {
         ]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn expand_replaces_known_names_only() {
         let lookup = |n: &str| (n.eq_ignore_ascii_case("root")).then(|| "C:\\W".to_string());
