@@ -666,3 +666,13 @@ The profiler now counts the heap of bebo: a counting allocator adds and removes 
 - Each tab adds about 7 MB. About 4 MB of that is fixed buffers in the libraries: two 1 MB pipe buffers (alacritty_terminal) and a 2 MB buffer for synchronized output (vte). bebo cannot change them without a copy of the libraries.
 - A full scrollback of 10,000 lines at 120 columns uses about 29 MB.
 - Change: the cache of shaped rows has a limit of 400 rows (about 10 screens), not 1500. That saves about 10 MB after large output. Scrolling back more than 10 screens shapes the rows again, at about 30 us for each row.
+
+## 22. Links, fonts, and pane keys (2026-11-17)
+
+- **Wrapped links.** A link that the terminal wraps to the next row is one link. `logical_line` joins the rows that have the `WRAPLINE` flag (at most 16 rows up and down). Before, a click on a wrapped URL opened only the part on one row.
+- **Links open with a click.** A click with no drag on a link opens it. The mouse pointer is a hand on every link. A drag still selects the text. In the command line that you type, a click moves the shell cursor, as before. In a program that gets the mouse (vim, less), only Ctrl+click opens a link.
+- **Link color.** Every http and https URL in the view, and every OSC 8 hyperlink, has the accent color. A URL starts at `http`, also after other text, for example `url=https://...`. File paths get color only below the mouse, because each path needs a disk check.
+- **Font weight.** Settings > Appearance > Font weight: 100 to 900 in steps of 100 for the terminal font. Bold text is 300 heavier. Only the regular and bold files load at the start, so another weight reads the system font folders first (about 100 ms, one time). A font without that weight uses its nearest weight.
+- **Interface font.** Settings > Appearance > Interface font: any installed font for the tabs, the menus, and the settings page. The default is Geist.
+- **Pane keys.** Alt+Left, Alt+Right, Alt+Up, and Alt+Down move the focus to the pane on that side. With one pane, the shell gets these keys. The command palette has the same commands ("Focus pane left" and the others).
+- **Prompt weight.** The prompt rows (the prompt line of each command and the command line now) are one weight step heavier than the output: 400 gives 500 (Medium). The request was +50, but a font file has only steps of 100, and the font search picks the lower weight for 450, so +50 gave no change in a pixel test. The Medium file of the default font loads at the start.

@@ -26,6 +26,8 @@ pub enum Font {
     /// Terminal font, fixed width.
     #[default]
     Mono,
+    /// Terminal font for the prompt rows: one weight step heavier than `Mono`, so that the prompt and the output look different.
+    MonoPrompt,
     /// Interface font.
     Ui,
     UiBold,
@@ -175,6 +177,8 @@ pub struct Gpu {
     /// All installed font families: (name, fixed width). Empty until `families` reads the system fonts.
     families: Vec<(String, bool)>,
     ui: String,
+    /// Weight of the terminal font, 100 to 900. Bold text is 300 heavier.
+    weight: u16,
     /// Images as RGBA pixels. The key is the image id and the size in pixels (the images are squares).
     images: HashMap<(u16, u16), Vec<u8>>,
     /// Shaped text for each row content. The key is the hash of the row.
@@ -259,7 +263,8 @@ impl Gpu {
         // Load only the fonts that bebo uses. A scan of all system fonts is slow.
         let mut db = fontdb::Database::new();
         let user_fonts = std::env::var("LOCALAPPDATA").unwrap_or_default() + r"\Microsoft\Windows\Fonts\";
-        for file in ["JetBrainsMonoNL-Regular.ttf", "JetBrainsMonoNL-Bold.ttf", "JetBrainsMonoNL-Italic.ttf"] {
+        // Medium is for the prompt rows, which are 50 heavier than regular.
+        for file in ["JetBrainsMonoNL-Regular.ttf", "JetBrainsMonoNL-Medium.ttf", "JetBrainsMonoNL-Bold.ttf", "JetBrainsMonoNL-Italic.ttf"] {
             if db.load_font_file(format!("{user_fonts}{file}")).is_err() {
                 let _ = db.load_font_file(format!(r"C:\Windows\Fonts\{file}"));
             }
@@ -308,6 +313,7 @@ impl Gpu {
             mono,
             families: Vec::new(),
             ui,
+            weight: 400,
             images: HashMap::new(),
             row_cache: HashMap::new(),
             frame_number: 0,
@@ -369,17 +375,45 @@ impl Gpu {
         &self.families
     }
 
-    /// Selects the terminal font. A name that is not installed changes nothing.
-    pub fn set_mono(&mut self, name: &str) {
+    pub fn ui(&self) -> &str {
+        &self.ui
+    }
+
+    /// True if font `name` is installed. The first unknown name reads the system font folders.
+    fn installed(&mut self, name: &str) -> bool {
         let has = |db: &fontdb::Database| db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
-        if name.is_empty() || name == self.mono {
-            return;
-        }
         if !has(self.font_system.db()) {
             self.families();
         }
-        if has(self.font_system.db()) {
+        has(self.font_system.db())
+    }
+
+    /// Selects the terminal font. A name that is not installed changes nothing.
+    pub fn set_mono(&mut self, name: &str) {
+        if !name.is_empty() && name != self.mono && self.installed(name) {
             self.mono = name.to_string();
+            self.set_font_px(self.font_px);
+        }
+    }
+
+    /// Selects the interface font. An empty name selects Geist, the font inside bebo.
+    pub fn set_ui(&mut self, name: &str) {
+        let name = if name.is_empty() { "Geist" } else { name };
+        if name != self.ui && self.installed(name) {
+            self.ui = name.to_string();
+            self.row_cache.clear();
+        }
+    }
+
+    /// Sets the weight of the terminal font. Only the regular and bold files load at the start,
+    /// so another weight reads the system font folders. A font without that weight uses its nearest weight.
+    pub fn set_weight(&mut self, weight: u16) {
+        let weight = weight.clamp(100, 900) / 100 * 100;
+        if weight != self.weight {
+            if weight != 400 {
+                self.families();
+            }
+            self.weight = weight;
             self.set_font_px(self.font_px);
         }
     }
@@ -388,7 +422,7 @@ impl Gpu {
         self.font_px = font_px.clamp(6.0, 96.0);
         self.cell_h = (self.font_px * 1.25).ceil();
         let mut probe = Buffer::new(&mut self.font_system, Metrics::new(self.font_px, self.cell_h));
-        let attrs = Attrs::new().family(Family::Name(&self.mono));
+        let attrs = Attrs::new().family(Family::Name(&self.mono)).weight(Weight(self.weight));
         probe.set_text("M", &attrs, Shaping::Advanced, None);
         probe.shape_until_scroll(&mut self.font_system, false);
         let advance = probe.layout_runs().next().and_then(|run| run.glyphs.first().map(|g| g.w));
@@ -425,16 +459,22 @@ impl Gpu {
         let mut missed = false;
         let entry = self.row_cache.entry(key).or_insert_with(|| {
             missed = true;
-            let mono = row.font == Font::Mono;
+            let mono = matches!(row.font, Font::Mono | Font::MonoPrompt);
             let family = match row.font {
-                Font::Mono => self.mono.as_str(),
+                Font::Mono | Font::MonoPrompt => self.mono.as_str(),
                 Font::Ui | Font::UiBold => self.ui.as_str(),
                 Font::Icon => "lucide",
             };
             let mut base = Attrs::new().family(Family::Name(family));
-            if row.font == Font::UiBold {
-                base = base.weight(Weight::SEMIBOLD);
-            }
+            let regular = match row.font {
+                Font::Mono => Weight(self.weight),
+                // The prompt is 50 heavier, rounded up to the next step of 100: a font file has only these steps,
+                // and the font search picks the lower weight for 450. So 400 gives 500 (Medium).
+                Font::MonoPrompt => Weight((self.weight + 50).div_ceil(100) * 100),
+                _ => Weight::NORMAL,
+            };
+            base = base.weight(if row.font == Font::UiBold { Weight::SEMIBOLD } else { regular });
+            let bold = Weight((regular.0 + 300).min(950));
             let line_height = if mono && row.size == 0.0 { self.cell_h } else { (size * 1.4).ceil() };
             let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, line_height));
             buffer.set_wrap(Wrap::None);
@@ -442,7 +482,7 @@ impl Gpu {
             let spans = row.spans.iter().map(|s| {
                 let mut attrs = base.clone().color(Color::rgba(s.color[0], s.color[1], s.color[2], 255 - row.fade));
                 if s.bold {
-                    attrs = attrs.weight(Weight::BOLD);
+                    attrs = attrs.weight(bold);
                 }
                 if s.italic {
                     attrs = attrs.style(Style::Italic);

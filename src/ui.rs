@@ -159,7 +159,7 @@ impl App {
             let focused = id == focus;
             let find = self.find.as_ref().filter(|_| focused);
             let colon = self.colon.as_ref().filter(|_| focused);
-            let link = self.hover_link.filter(|link| link.0 == id).map(|link| (link.1, link.2, link.3));
+            let link = self.hover_link.filter(|link| link.0 == id).map(|link| (link.1, link.2));
             let lane_hot = self.drag_minimap == Some(id) || self.hover == Some(Hit::Minimap(id));
             let view = View { rect, focused, multi, bottom: self.bottom, find, colon, link, lane_hot };
             let (top, cursor) = draw_pane(&mut frame, &mut anim, id, pane, &view, &m, &t, &self.settings);
@@ -477,10 +477,12 @@ impl App {
                 row("Command popup", "Where the colon popup opens", Choice(2, vec!["Auto", "Always below", "Always above"], st.popup as usize)),
                 row("Font", "All installed fonts. Fixed-width fonts are first.", Select(3, ui.gpu.mono().to_string())),
                 row("Font size", "8 to 32 px. Ctrl+= and Ctrl+- also change it.", Step(4, format!("{}", st.font_px))),
+                row("Font weight", "400 is regular, 700 is bold. Bold text is 300 heavier.", Step(11, format!("{}", st.font_weight))),
+                row("Interface font", "Tabs, menus, and this page", Select(12, ui.gpu.ui().to_string())),
                 row("Cursor", "Shape of the caret on the prompt", Choice(5, vec!["Beam", "Block", "Underline"], st.cursor as usize)),
                 row("Tab bar", "Auto: with one tab, the title bar shows the tab name", Choice(6, vec!["Auto", "Always", "Never"], st.tab_bar as usize)),
                 row("Minimap", "Marks for failed commands and find matches", Toggle(7, st.minimap)),
-                row("Clickable paths", "Ctrl+click opens a path or a link", Toggle(8, st.links)),
+                row("Clickable links", "A click opens a link or a path. Links have color.", Toggle(8, st.links)),
                 row("Animations", "The caret and the popups move smoothly", Toggle(9, st.animations)),
             ],
             1 => {
@@ -501,7 +503,9 @@ impl App {
             _ => self.entries().into_iter().filter(|e| !e.keys.is_empty()).map(|e| (e.title, "", Label(e.keys.to_string()))).collect(),
         };
 
-        let row_h = if page == 2 { 28.0 * s } else { 48.0 * s };
+        // ponytail: the page does not scroll. The rows get lower to fit the window, down to 36 px; a lower window cuts the last rows.
+        let fit = (ui.h - m.bar - 68.0 * s) / rows.len().max(1) as f32;
+        let row_h = if page == 2 { 28.0 * s } else { fit.clamp(36.0 * s, 48.0 * s) };
         let mut y = m.bar + 60.0 * s;
         let mut font_box = None;
         for (title, description, control) in rows {
@@ -569,12 +573,14 @@ impl App {
                 Select(id, name) => {
                     let width = (ui.width(&name, Font::Ui, 12.0) + 48.0 * s).max(200.0 * s);
                     let r = Rect { x: right - width, y: box_y, w: width, h: box_h };
-                    let open = self.font_menu.is_some();
+                    let open = self.font_menu.is_some() && self.font_target == id;
                     ui.panel(r, if ui.hot(r) || open { t.panel_hi } else { t.bg }, 5.0 * s);
                     ui.text(r.x + 11.0 * s, mid, &name, t.fg, Font::Ui, 12.0, Align::Left);
                     ui.icon(r.x + r.w - 15.0 * s, mid, if open { Icon::ChevronUp } else { Icon::ChevronDown }, t.dim, 13.0);
                     ui.hit(r, Hit::Setting(id, 0));
-                    font_box = Some(r);
+                    if open {
+                        font_box = Some(r);
+                    }
                     r.x
                 },
                 Label(keys) => {
@@ -624,12 +630,16 @@ impl App {
         // The font list opens below the font box.
         if let (Some(scroll), Some(anchor)) = (self.font_menu, font_box) {
             let families = ui.gpu.families().to_vec();
-            let current = ui.gpu.mono().to_string();
+            let current = if self.font_target == 12 { ui.gpu.ui() } else { ui.gpu.mono() }.to_string();
             let count = families.len();
             let first = (scroll as usize).min(count.saturating_sub(FONT_ROWS));
             let row_h = 25.0 * s;
             let width = (300.0 * s).max(anchor.w);
-            let r = Rect { x: anchor.x + anchor.w - width, y: anchor.y + anchor.h + 4.0 * s, w: width, h: count.min(FONT_ROWS) as f32 * row_h + 8.0 * s };
+            let h = count.min(FONT_ROWS) as f32 * row_h + 8.0 * s;
+            // The list opens above the box if the window has no room below it.
+            let below = anchor.y + anchor.h + 4.0 * s;
+            let y = if below + h > ui.h && anchor.y - 4.0 * s - h >= m.bar { anchor.y - 4.0 * s - h } else { below };
+            let r = Rect { x: anchor.x + anchor.w - width, y, w: width, h };
             ui.pop(A_FONTS);
             ui.panel(r, t.panel, 6.0 * s);
             ui.hit(r, Hit::Block);
@@ -861,8 +871,8 @@ struct View<'a> {
     bottom: bool,
     find: Option<&'a Find>,
     colon: Option<&'a Colon>,
-    /// The link below the mouse: grid line, first column, last column.
-    link: Option<(i32, usize, usize)>,
+    /// The link below the mouse: first cell and last cell. A wrapped link has cells on two or more rows.
+    link: Option<(Point, Point)>,
     /// The mouse is on the minimap.
     lane_hot: bool,
 }
@@ -925,9 +935,46 @@ fn draw_pane(
         }
     }
 
+    // The prompt rows use a font 50 heavier than the output: the prompt line of each command (with its wrapped rows),
+    // and the command line now. The block lines are wrong when the scrollback is full, so then only the command line is heavier.
+    let mut prompt_lines: Vec<(i32, i32)> = Vec::new();
+    if !alt {
+        let (screen_end, last) = (grid.screen_lines() as i32 - 1, Column(cols - 1));
+        if history < 10_000 {
+            for block in &pane.blocks {
+                let first = block.line - history;
+                if first < top - 16 || first >= top + rows || first < -history || first > screen_end {
+                    continue;
+                }
+                let mut end = first;
+                while end < screen_end && end - first < 16 && grid[Line(end)][last].flags.contains(Flags::WRAPLINE) {
+                    end += 1;
+                }
+                prompt_lines.push((first, end));
+            }
+        }
+        if let Some(r) = &region {
+            prompt_lines.push((r.start.line.0, r.point(r.end).line.0));
+        }
+    }
+
+    // URLs in the view have the link color. Each wrapped line is read once.
+    let mut urls: Vec<(Point, Point)> = Vec::new();
+    if settings.links {
+        let mut row = (-history - top).max(0);
+        while row < rows {
+            let (chars, points) = logical_line(grid, Line(top + row));
+            if chars.contains(&':') {
+                urls.extend(url_spans(&chars).into_iter().map(|(start, end)| (points[start], points[end - 1])));
+            }
+            row = points.last().map_or(row + 1, |p| (p.line.0 - top + 1).max(row + 1));
+        }
+    }
+
     for row in (-history - top).max(0)..rows {
         let line = Line(top + row);
         let y = oy + row as f32 * ch;
+        let font = if prompt_lines.iter().any(|(a, b)| (*a..=*b).contains(&line.0)) { Font::MonoPrompt } else { Font::Mono };
         let mut spans: Vec<Span> = Vec::new();
         // A fallback font has its own character width. Each wide character is a separate text row at its cell,
         // so that the text after it stays on the cell grid. `seg_x` is the start of the current text row.
@@ -941,6 +988,9 @@ fn draw_pane(
             let point = Point::new(line, Column(col));
             let mut fg = resolve(cell.fg, term.colors(), t);
             let mut bg = resolve(cell.bg, term.colors(), t);
+            if settings.links && (cell.hyperlink().is_some() || urls.iter().any(|(a, b)| *a <= point && point <= *b)) {
+                fg = t.accent;
+            }
             if flags.contains(Flags::INVERSE) {
                 std::mem::swap(&mut fg, &mut bg);
             }
@@ -973,13 +1023,13 @@ fn draw_pane(
             let (bold, italic) = (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC));
             if flags.contains(Flags::WIDE_CHAR) {
                 if spans.iter().any(|s| !s.text.trim().is_empty()) {
-                    frame.rows.push(Row { x: seg_x, y, clip, spans: std::mem::take(&mut spans), ..Default::default() });
+                    frame.rows.push(Row { x: seg_x, y, clip, spans: std::mem::take(&mut spans), font, ..Default::default() });
                 }
                 spans.clear();
                 let mut text = c.to_string();
                 text.extend(cell.zerowidth().into_iter().flatten());
                 let span = Span { text, color: fg, bold, italic };
-                frame.rows.push(Row { x, y, clip, spans: vec![span], ..Default::default() });
+                frame.rows.push(Row { x, y, clip, spans: vec![span], font, ..Default::default() });
                 seg_x = x + w;
                 continue;
             }
@@ -1000,7 +1050,7 @@ fn draw_pane(
             spans.pop();
         }
         if !spans.is_empty() {
-            frame.rows.push(Row { x: seg_x, y, clip, spans, ..Default::default() });
+            frame.rows.push(Row { x: seg_x, y, clip, spans, font, ..Default::default() });
         }
     }
 
@@ -1047,12 +1097,14 @@ fn draw_pane(
         }
     }
 
-    // The path or the link below the mouse has an underline.
-    if let Some((line, first, last)) = link
-        && (0..rows).contains(&(line - top))
-    {
-        let y = oy + (line - top + 1) as f32 * ch - (2.0 * s).max(1.0);
-        frame.overlay.push(quad(ox + first as f32 * cw, y, (last + 1 - first) as f32 * cw, s.max(1.0), t.accent));
+    // The path or the link below the mouse has an underline, on each row of the link.
+    if let Some((a, b)) = link {
+        for line in a.line.0.max(top)..=b.line.0.min(top + rows - 1) {
+            let first = if line == a.line.0 { a.column.0 } else { 0 };
+            let last = if line == b.line.0 { b.column.0 } else { cols - 1 };
+            let y = oy + (line - top + 1) as f32 * ch - (2.0 * s).max(1.0);
+            frame.overlay.push(quad(ox + first as f32 * cw, y, (last + 1 - first) as f32 * cw, s.max(1.0), t.accent));
+        }
     }
 
     // Command blocks: the duration and the exit code of a command, at the right side of its prompt line.

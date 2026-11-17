@@ -316,6 +316,8 @@ enum Cmd {
     NextTab,
     SplitDown,
     SplitRight,
+    /// Moves the focus to the next pane: 0 left, 1 right, 2 up, 3 down.
+    FocusPane(u8),
     ClosePane,
     Find,
     Restart,
@@ -541,12 +543,16 @@ struct Settings {
     font: String,
     /// Font size in logical pixels.
     font_px: f32,
+    /// Weight of the terminal font: 100 (thin) to 900 (black). 400 is regular.
+    font_weight: u16,
+    /// Interface font name. Empty: Geist, the font inside bebo.
+    ui_font: String,
     /// 0: beam, 1: block, 2: underline.
     cursor: u8,
     /// 0: tabs show with two or more tabs, 1: always, 2: never.
     tab_bar: u8,
     minimap: bool,
-    /// Ctrl+Click opens a path or a link.
+    /// A click opens a path or a link, and URLs have the link color.
     links: bool,
     /// The caret and the popups move smoothly.
     animations: bool,
@@ -567,6 +573,8 @@ impl Settings {
             popup: 0,
             font: String::new(),
             font_px: FONT_PX,
+            font_weight: 400,
+            ui_font: String::new(),
             cursor: 0,
             tab_bar: 0,
             minimap: true,
@@ -584,6 +592,8 @@ impl Settings {
                 "popup" => s.popup = pick(&POPUPS, value, s.popup),
                 "font" => s.font = value.to_string(),
                 "font_size" => s.font_px = value.parse().unwrap_or(FONT_PX).clamp(FONT_MIN, FONT_MAX),
+                "font_weight" => s.font_weight = value.parse().unwrap_or(400u16).clamp(100, 900) / 100 * 100,
+                "ui_font" => s.ui_font = value.to_string(),
                 "cursor" => s.cursor = pick(&CURSORS, value, s.cursor),
                 "tab_bar" => s.tab_bar = pick(&TAB_BARS, value, s.tab_bar),
                 "minimap" => s.minimap = value != "off",
@@ -599,12 +609,14 @@ impl Settings {
     fn to_text(&self, bottom: bool) -> String {
         let on = |v: bool| if v { "on" } else { "off" };
         format!(
-            "theme={}\nposition={}\npopup={}\nfont={}\nfont_size={}\ncursor={}\ntab_bar={}\nminimap={}\nlinks={}\nanimations={}\nprofile={}\n",
+            "theme={}\nposition={}\npopup={}\nfont={}\nfont_size={}\nfont_weight={}\nui_font={}\ncursor={}\ntab_bar={}\nminimap={}\nlinks={}\nanimations={}\nprofile={}\n",
             THEMES[self.theme as usize],
             if bottom { "bottom" } else { "top" },
             POPUPS[self.popup as usize],
             self.font,
             self.font_px,
+            self.font_weight,
+            self.ui_font,
             CURSORS[self.cursor as usize],
             TAB_BARS[self.tab_bar as usize],
             on(self.minimap),
@@ -679,6 +691,8 @@ struct App {
     settings_page: usize,
     /// The font list is open. The value is the first row in view.
     font_menu: Option<f32>,
+    /// The settings row of the open font list: 3 is the terminal font, 12 is the interface font.
+    font_target: u8,
     anim: Anim,
     last_frame: Instant,
     /// A shell has new output that is not on the screen.
@@ -695,7 +709,8 @@ struct App {
     /// The cell below the mouse: (pane, cell).
     hover_cell: Option<(usize, Point)>,
     /// The link below the mouse: (pane, grid line, first column, last column).
-    hover_link: Option<(usize, i32, usize, usize)>,
+    /// The link below the mouse: pane, first cell, last cell.
+    hover_link: Option<(usize, Point, Point)>,
     /// bebo runs as administrator.
     admin: bool,
     /// The icon of the window and of the taskbar button.
@@ -932,6 +947,8 @@ impl App {
         self.scale = window.scale_factor() as f32;
         let mut gpu = Gpu::new(window, parts, self.settings.font_px * self.scale, self.start);
         gpu.set_mono(&self.settings.font);
+        gpu.set_ui(&self.settings.ui_font);
+        gpu.set_weight(self.settings.font_weight);
         // Image ids: 0 is the bebo icon. 1 to 3 are the shell icons, see `Profile::image`.
         add_icon!(gpu, 0, "app/bebo");
         add_icon!(gpu, 1, "shell/powershell");
@@ -1008,6 +1025,33 @@ impl App {
         self.pane_rects.iter().copied().find(|(_, r)| r.contains(x, y))
     }
 
+    /// Moves the focus to the pane next to the focused pane: 0 left, 1 right, 2 up, 3 down.
+    /// Of the panes on that side, the nearest pane wins, then the pane nearest to the middle of the focused pane.
+    fn focus_dir(&mut self, dir: u8) {
+        let focus = self.tabs[self.active].focus;
+        let Some(c) = self.pane_rect(focus) else { return };
+        let key = |r: &Rect| {
+            let gap = match dir {
+                0 => c.x - (r.x + r.w),
+                1 => r.x - (c.x + c.w),
+                2 => c.y - (r.y + r.h),
+                _ => r.y - (c.y + c.h),
+            };
+            let off = if dir < 2 { (r.y + r.h / 2.0 - c.y - c.h / 2.0).abs() } else { (r.x + r.w / 2.0 - c.x - c.w / 2.0).abs() };
+            (gap >= -1.0).then_some(gap.max(0.0).round() * 10_000.0 + off)
+        };
+        let next = self.pane_rects.iter().filter(|(id, _)| *id != focus).filter_map(|(id, r)| key(r).map(|k| (*id, k)));
+        if let Some((id, _)) = next.min_by(|a, b| a.1.total_cmp(&b.1)) {
+            self.tabs[self.active].focus = id;
+            self.relayout();
+        }
+    }
+
+    /// The program in pane `id` gets the mouse events (vim, less, htop). Shift+click is for bebo.
+    fn mouse_reported(&self, id: usize) -> bool {
+        !self.mods.shift_key() && self.panes.get(&id).is_some_and(|p| p.term.lock().mode().intersects(TermMode::MOUSE_MODE))
+    }
+
     fn pane_rect(&self, id: usize) -> Option<Rect> {
         self.pane_rects.iter().find(|(p, _)| *p == id).map(|(_, r)| *r)
     }
@@ -1078,7 +1122,7 @@ impl App {
             self.menu = false;
             self.redraw();
         }
-        if self.font_menu.is_some() && !matches!(hit, Some(Hit::Font(_) | Hit::Setting(3, _))) {
+        if self.font_menu.is_some() && !matches!(hit, Some(Hit::Font(_) | Hit::Setting(3 | 12, _))) {
             self.font_menu = None;
             self.redraw();
         }
@@ -1268,7 +1312,7 @@ impl App {
         if cell != self.hover_cell {
             self.hover_cell = cell;
             // ponytail: each new cell asks the disk if the path exists. Add a cache if a network folder makes this slow.
-            let link = cell.and_then(|(id, point)| self.link_at(id, point).map(|(_, first, last)| (id, point.line.0, first, last)));
+            let link = cell.and_then(|(id, point)| self.link_at(id, point).map(|(_, first, last)| (id, first, last)));
             if link != self.hover_link {
                 self.hover_link = link;
                 self.redraw();
@@ -1283,7 +1327,10 @@ impl App {
                 (None, Some(_), _) => CursorIcon::Default,
                 (None, None, Some(i)) if self.dividers[i].side_by_side => CursorIcon::ColResize,
                 (None, None, Some(_)) => CursorIcon::RowResize,
-                (None, None, None) if self.hover_link.is_some() && self.mods.control_key() => CursorIcon::Pointer,
+                // A click opens a link. In a program that gets the mouse (vim, less), only Ctrl+click opens it.
+                (None, None, None) if self.hover_link.is_some_and(|(id, ..)| self.mods.control_key() || !self.mouse_reported(id)) => {
+                    CursorIcon::Pointer
+                },
                 (None, None, None) => CursorIcon::Text,
             };
             window.set_cursor(icon);
@@ -1332,14 +1379,19 @@ impl App {
             return;
         }
         // A click with no drag in the command line moves the shell cursor to the click.
+        // A click with no drag on a link in the output opens it. A drag selects the text of the link.
         let Some(pane) = self.panes.get(&press.pane) else { return };
         let term = pane.term.lock();
-        let Some(region) = Region::new(pane, &term) else { return };
-        let target = region.idx(press.point) + if press.side == Side::Right { 1 } else { 0 };
-        let last_line = region.point(region.end).line;
-        if target < 0 || press.point.line > last_line {
+        let region = Region::new(pane, &term);
+        let in_command = region.as_ref().is_some_and(|r| r.idx(press.point) >= 0 && press.point.line <= r.point(r.end).line);
+        let Some(region) = region.filter(|_| in_command) else {
+            drop(term);
+            if self.settings.links {
+                self.open_link(press.pane, press.point);
+            }
             return;
-        }
+        };
+        let target = region.idx(press.point) + if press.side == Side::Right { 1 } else { 0 };
         let mut bytes = Vec::new();
         region.arrows(&term, region.cursor, target.min(region.end), &mut bytes);
         drop(term);
@@ -1488,29 +1540,21 @@ impl App {
         self.redraw();
     }
 
-    /// The URL or the file path at `point`: the target to open, and the first and last column of its text.
-    fn link_at(&self, id: usize, point: Point) -> Option<(String, usize, usize)> {
+    /// The URL or the file path at `point`: the target to open, and the first and last cell of its text.
+    /// A link can continue on the next rows if the terminal wrapped the line.
+    fn link_at(&self, id: usize, point: Point) -> Option<(String, Point, Point)> {
         let pane = self.panes.get(&id)?;
         let term = pane.term.lock();
         let grid = term.grid();
         let (text, first, last) = match grid[point.line][point.column].hyperlink() {
-            Some(link) => (link.uri().to_string(), point.column.0, point.column.0),
+            Some(link) => (link.uri().to_string(), point, point),
             None => {
-                let (mut chars, mut columns) = (Vec::new(), Vec::new());
-                let mut index = 0;
-                for col in 0..grid.columns() {
-                    let cell = &grid[point.line][Column(col)];
-                    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                        continue;
-                    }
-                    if col <= point.column.0 {
-                        index = chars.len();
-                    }
-                    chars.push(cell.c);
-                    columns.push(col);
-                }
-                let (start, end) = token_range(&chars, index)?;
-                (chars[start..end].iter().collect(), columns[start], columns[end - 1])
+                let (chars, points) = logical_line(grid, point.line);
+                let index = points.iter().rposition(|p| *p <= point)?;
+                // A URL starts at "http", also after other text, for example `url=https://...`.
+                let url = url_spans(&chars).into_iter().find(|(start, end)| (*start..*end).contains(&index));
+                let (start, end) = url.or_else(|| token_range(&chars, index))?;
+                (chars[start..end].iter().collect(), points[start], points[end - 1])
             },
         };
         drop(term);
@@ -1562,6 +1606,10 @@ impl App {
             entry("Session", "Restart shell \u{b7} force", "", Cmd::RestartForce),
             entry("Session", "Restart shell \u{b7} clean, content lost", "", Cmd::RestartClean),
             entry("Session", "Clear output", "Ctrl+K", Cmd::Clear),
+            entry("Pane", "Focus pane left", "Alt+Left", Cmd::FocusPane(0)),
+            entry("Pane", "Focus pane right", "Alt+Right", Cmd::FocusPane(1)),
+            entry("Pane", "Focus pane up", "Alt+Up", Cmd::FocusPane(2)),
+            entry("Pane", "Focus pane down", "Alt+Down", Cmd::FocusPane(3)),
             entry("Pane", "Close pane", "Ctrl+Shift+W", Cmd::ClosePane),
             entry("Tab", "Next tab", "Ctrl+Tab", Cmd::NextTab),
             entry("Edit", "Copy", "Ctrl+Shift+C", Cmd::Copy),
@@ -1632,6 +1680,7 @@ impl App {
             },
             Cmd::SplitDown => self.split(false),
             Cmd::SplitRight => self.split(true),
+            Cmd::FocusPane(dir) => self.focus_dir(dir),
             Cmd::ClosePane => self.close_pane(focus),
             Cmd::Find => {
                 if self.find.is_none() {
@@ -1931,6 +1980,15 @@ impl App {
             (true, _, false, "v", _) => self.paste(),
             (false, true, true, ..) if code == Some(KeyCode::Minus) => self.run(Cmd::SplitDown),
             (false, true, true, ..) if code == Some(KeyCode::Equal) => self.run(Cmd::SplitRight),
+            // With one pane, the shell gets Alt+arrow.
+            (false, false, true, ..)
+                if self.pane_rects.len() > 1
+                    && let Some(dir) = [KeyCode::ArrowLeft, KeyCode::ArrowRight, KeyCode::ArrowUp, KeyCode::ArrowDown]
+                        .iter()
+                        .position(|c| Some(*c) == code) =>
+            {
+                self.run(Cmd::FocusPane(dir as u8))
+            },
             (true, true, false, ..) if matches!(code, Some(KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4)) => {
                 let index = [KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4].iter().position(|c| Some(*c) == code);
                 if let Some(profile) = index.and_then(|i| self.profiles.get(i)).copied() {
@@ -2128,11 +2186,14 @@ impl App {
             },
             1 => self.bottom = value == 1,
             2 => self.settings.popup = value.min(2),
-            3 => {
+            3 | 12 => {
                 // Opens or closes the font list. The list opens near the font in use.
-                self.font_menu = match (self.font_menu, self.gpu.as_mut()) {
+                // A click on the other font box closes the list and opens it for that box.
+                let other = self.font_target != id;
+                self.font_target = id;
+                self.font_menu = match (self.font_menu.filter(|_| !other), self.gpu.as_mut()) {
                     (None, Some(gpu)) => {
-                        let current = gpu.mono().to_string();
+                        let current = if id == 3 { gpu.mono() } else { gpu.ui() }.to_string();
                         let families = gpu.families();
                         let index = families.iter().position(|(name, _)| *name == current).unwrap_or(0);
                         Some(index.saturating_sub(3).min(families.len().saturating_sub(FONT_ROWS)) as f32)
@@ -2152,19 +2213,31 @@ impl App {
             8 => self.settings.links = !self.settings.links,
             9 => self.settings.animations = !self.settings.animations,
             10 => self.settings.profile = self.profiles.get(value as usize).copied(),
+            11 => {
+                let weight = if value == 1 { self.settings.font_weight + 100 } else { self.settings.font_weight.saturating_sub(100) };
+                self.settings.font_weight = weight.clamp(100, 900);
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.set_weight(self.settings.font_weight);
+                }
+            },
             _ => {},
         }
         self.apply_settings();
     }
 
-    /// Selects row `index` of the font list as the terminal font.
+    /// Selects row `index` of the font list as the terminal font or the interface font.
     fn set_font_family(&mut self, index: usize) {
         self.font_menu = None;
         if let Some(gpu) = self.gpu.as_mut()
             && let Some((name, _)) = gpu.families().get(index).cloned()
         {
-            gpu.set_mono(&name);
-            self.settings.font = name;
+            if self.font_target == 12 {
+                gpu.set_ui(&name);
+                self.settings.ui_font = if name == "Geist" { String::new() } else { name };
+            } else {
+                gpu.set_mono(&name);
+                self.settings.font = name;
+            }
         }
         self.apply_settings();
     }
@@ -2458,6 +2531,57 @@ fn token_range(chars: &[char], index: usize) -> Option<(usize, usize)> {
     (end > start).then_some((start, end))
 }
 
+/// The characters of the line that contains `line`, with the grid point of each character.
+/// The rows that the terminal wrapped are one line.
+pub(crate) fn logical_line(grid: &alacritty_terminal::Grid<alacritty_terminal::term::cell::Cell>, line: Line) -> (Vec<char>, Vec<Point>) {
+    let (top, bottom) = (-(grid.history_size() as i32), grid.screen_lines() as i32 - 1);
+    let last = Column(grid.columns() - 1);
+    let wraps = |l: i32| grid[Line(l)][last].flags.contains(Flags::WRAPLINE);
+    // ponytail: at most 16 rows up and down. A longer wrapped line is cut, so that one line costs little.
+    let mut first = line.0;
+    while first > top && line.0 - first < 16 && wraps(first - 1) {
+        first -= 1;
+    }
+    let mut end = line.0;
+    while end < bottom && end - line.0 < 16 && wraps(end) {
+        end += 1;
+    }
+    let (mut chars, mut points) = (Vec::new(), Vec::new());
+    for l in first..=end {
+        for col in 0..grid.columns() {
+            let cell = &grid[Line(l)][Column(col)];
+            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue;
+            }
+            chars.push(cell.c);
+            points.push(Point::new(Line(l), Column(col)));
+        }
+    }
+    (chars, points)
+}
+
+/// The http and https URLs in `chars`: the start and the end index of each.
+pub(crate) fn url_spans(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i + 3 <= chars.len() {
+        if chars[i..i + 3] == [':', '/', '/'] {
+            let scheme = |s: &str| i >= s.len() && chars[i - s.len()..i].iter().copied().eq(s.chars());
+            let start = if scheme("https") { Some(i - 5) } else if scheme("http") { Some(i - 4) } else { None };
+            if let Some(start) = start
+                && let Some((_, end)) = token_range(chars, start)
+                && end > i + 3
+            {
+                spans.push((start, end));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    spans
+}
+
 #[cfg(test)]
 fn token_at(chars: &[char], index: usize) -> String {
     token_range(chars, index).map_or(String::new(), |(start, end)| chars[start..end].iter().collect())
@@ -2613,6 +2737,7 @@ fn main() {
         settings,
         settings_page: 0,
         font_menu: None,
+        font_target: 3,
         anim: Anim::default(),
         last_frame: start,
         dirty: false,
@@ -2648,6 +2773,18 @@ mod tests {
         assert_eq!(enc(Key::Named(NamedKey::ArrowRight), None, ModifiersState::CONTROL), b"\x1b[1;5C");
         assert_eq!(enc(Key::Character("a".into()), Some("a"), ModifiersState::ALT), b"\x1ba");
         assert_eq!(encode_key(&Key::Named(NamedKey::ArrowUp), None, none, true).unwrap(), b"\x1bOA");
+    }
+
+    #[test]
+    fn urls_start_at_the_scheme() {
+        let text = |s: &str| s.chars().collect::<Vec<_>>();
+        let urls = |s: &str| {
+            let chars = text(s);
+            url_spans(&chars).into_iter().map(|(a, b)| chars[a..b].iter().collect::<String>()).collect::<Vec<_>>()
+        };
+        assert_eq!(urls("server: http://localhost:3000"), ["http://localhost:3000"]);
+        assert_eq!(urls("url=https://a.b/c?d=1, and (http://x.y)."), ["https://a.b/c?d=1", "http://x.y"]);
+        assert!(urls("no link: http:// or ftp://a").is_empty());
     }
 
     #[test]

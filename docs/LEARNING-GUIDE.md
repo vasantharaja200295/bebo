@@ -214,6 +214,12 @@ Test: idle CPU must be zero. A key must show on the screen in less than one fram
 4. **Encoding**: print text with `[Console]::Write` in Windows PowerShell 5.1. Find out why you get `???`, and which setting changes it.
 5. **Panic in a thread**: if the PTY thread stops, the pane goes blank. Find a way to see the panic message.
 
+### Stage 12b: Links and fonts
+
+1. Join the rows of a wrapped line with the `WRAPLINE` flag of the last cell. Find a URL that wraps, and check that the click opens all of it.
+2. Give every URL in the view a color. Do the search once for each wrapped line, not once for each row.
+3. Add a font weight setting. Find out why a weight that you did not load at the start shows as regular.
+
 ### Stage 13: Install
 
 1. Embed the icon in the program file with a build script.
