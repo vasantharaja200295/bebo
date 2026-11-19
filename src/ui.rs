@@ -1002,6 +1002,8 @@ fn draw_pane(
         }
     }
 
+    // The rectangles of box drawing and block characters.
+    let mut shapes: Vec<Quad> = Vec::new();
     for row in (-history - top).max(0)..rows {
         let line = Line(top + row);
         let y = oy + row as f32 * ch;
@@ -1050,9 +1052,16 @@ fn draw_pane(
             if flags.contains(Flags::STRIKEOUT) {
                 frame.overlay.push(quad(x, y + ch / 2.0, w, 1.0, fg));
             }
-            let c = if flags.contains(Flags::HIDDEN) || cell.c == '\t' { ' ' } else { cell.c };
+            let mut c = if flags.contains(Flags::HIDDEN) || cell.c == '\t' { ' ' } else { cell.c };
+            // Box drawing and block characters are rectangles, so that lines join and blocks fill the cell.
+            if cell_shape(c, x, y, cw, ch, fg, bg, &mut |x0, y0, x1, y1, color| shapes.push(quad(x0, y0, x1 - x0, y1 - y0, color))) {
+                c = ' ';
+            }
             let (bold, italic) = (flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC));
-            if flags.contains(Flags::WIDE_CHAR) {
+            // A wide character, and each character that is not ASCII, is a separate text row at its cell.
+            // A character from a fallback font (an icon, a symbol, a letter with an accent) can have another width,
+            // and the text after it in the same row then moves off the cell grid. ASCII has the width of the cell.
+            if flags.contains(Flags::WIDE_CHAR) || !c.is_ascii() {
                 if spans.iter().any(|s| !s.text.trim().is_empty()) {
                     frame.rows.push(Row { x: seg_x, y, clip, spans: std::mem::take(&mut spans), font, ..Default::default() });
                 }
@@ -1084,6 +1093,8 @@ fn draw_pane(
             frame.rows.push(Row { x: seg_x, y, clip, spans, font, ..Default::default() });
         }
     }
+    // After the cell backgrounds, before the text.
+    frame.quads.extend(shapes);
 
     let mono = |x: f32, y: f32, text: String, color: Rgb| Row {
         x,
@@ -1205,4 +1216,150 @@ fn draw_pane(
         }
     }
     (top, cursor_visible.then_some(cursor_px))
+}
+
+/// The arms of the box drawing characters U+2500 to U+257F: up, right, down, left.
+/// 0: no arm, 1: light, 2: heavy, 3: double. "x" is a diagonal, which the font draws.
+/// Dashed lines are solid lines here, and the rounded corners are square corners.
+const BOX_ARMS: [&str; 128] = [
+    "0101", "0202", "1010", "2020", "0101", "0202", "1010", "2020", "0101", "0202", "1010", "2020", "0110", "0210", "0120", "0220",
+    "0011", "0012", "0021", "0022", "1100", "1200", "2100", "2200", "1001", "1002", "2001", "2002", "1110", "1210", "2110", "1120",
+    "2120", "2210", "1220", "2220", "1011", "1012", "2011", "1021", "2021", "2012", "1022", "2022", "0111", "0112", "0211", "0212",
+    "0121", "0122", "0221", "0222", "1101", "1102", "1201", "1202", "2101", "2102", "2201", "2202", "1111", "1112", "1211", "1212",
+    "2111", "1121", "2121", "2112", "2211", "1122", "1221", "2212", "1222", "2122", "2221", "2222", "0101", "0202", "1010", "2020",
+    "0303", "3030", "0310", "0130", "0330", "0013", "0031", "0033", "1300", "3100", "3300", "1003", "3001", "3003", "1310", "3130",
+    "3330", "1013", "3031", "3033", "0313", "0131", "0333", "1303", "3101", "3303", "1313", "3131", "3333", "0110", "0011", "1001",
+    "1100", "x", "x", "x", "0001", "1000", "0100", "0010", "0002", "2000", "0200", "0020", "0201", "1020", "0102", "2010",
+];
+
+/// Draws a box drawing character (U+2500 to U+257F) or a block element (U+2580 to U+259F) in the cell at (`x`, `y`)
+/// as rectangles: `rect(x0, y0, x1, y1, color)`. Returns false for other characters, which the font draws.
+/// A font glyph of these characters often does not fill the cell, so the lines do not join from row to row.
+#[allow(clippy::too_many_arguments)]
+fn cell_shape(c: char, x: f32, y: f32, cw: f32, ch: f32, fg: Rgb, bg: Rgb, rect: &mut impl FnMut(f32, f32, f32, f32, Rgb)) -> bool {
+    let code = c as u32;
+    // Whole pixels: the edges of a cell are the same pixels as the edges of the cells next to it.
+    let (x0, y0, x1, y1) = (x.round(), y.round(), (x + cw).round(), (y + ch).round());
+    if (0x2580..=0x259f).contains(&code) {
+        let (w, h) = (x1 - x0, y1 - y0);
+        let eighth_h = |n: f32| (h * n / 8.0).round();
+        let eighth_w = |n: f32| (w * n / 8.0).round();
+        let (mx, my) = ((x0 + w / 2.0).round(), (y0 + h / 2.0).round());
+        match code {
+            0x2580 => rect(x0, y0, x1, my, fg),
+            0x2581..=0x2588 => rect(x0, y1 - eighth_h((code - 0x2580) as f32), x1, y1, fg),
+            0x2589..=0x258f => rect(x0, y0, x0 + eighth_w((0x2590 - code) as f32), y1, fg),
+            0x2590 => rect(mx, y0, x1, y1, fg),
+            0x2591..=0x2593 => rect(x0, y0, x1, y1, mix(bg, fg, (code - 0x2590) as f32 * 0.25)),
+            0x2594 => rect(x0, y0, x1, y0 + eighth_h(1.0), fg),
+            0x2595 => rect(x1 - eighth_w(1.0), y0, x1, y1, fg),
+            _ => {
+                // Quadrants U+2596 to U+259F. Bits: 1 upper left, 2 upper right, 4 lower left, 8 lower right.
+                let bits = [4, 8, 1, 13, 9, 7, 11, 2, 6, 14][(code - 0x2596) as usize];
+                let parts = [(x0, y0, mx, my), (mx, y0, x1, my), (x0, my, mx, y1), (mx, my, x1, y1)];
+                for (i, (a, b, c, d)) in parts.into_iter().enumerate() {
+                    if bits & (1 << i) != 0 {
+                        rect(a, b, c, d, fg);
+                    }
+                }
+            },
+        }
+        return true;
+    }
+    if !(0x2500..=0x257f).contains(&code) {
+        return false;
+    }
+    let arms = BOX_ARMS[(code - 0x2500) as usize].as_bytes();
+    if arms.len() != 4 {
+        return false;
+    }
+    let [up, right, down, left] = [arms[0] - b'0', arms[1] - b'0', arms[2] - b'0', arms[3] - b'0'];
+    // A light line is about one eighth of the cell width. A heavy line is two times that.
+    let t = (cw / 8.0).round().max(1.0);
+    let (cx, cy) = ((x0 + (x1 - x0) / 2.0).floor(), (y0 + (y1 - y0) / 2.0).floor());
+    // The first pixel of a line of width `w` with its middle at `p`.
+    let start = |p: f32, w: f32| p - (w / 2.0).floor();
+
+    // Light and heavy arms: from the middle of the cell to its edge. The arm covers the middle, so the arms join.
+    for (weight, horizontal, toward_end) in [(up, false, false), (right, true, true), (down, false, true), (left, true, false)] {
+        if weight == 0 || weight == 3 {
+            continue;
+        }
+        let w = if weight == 2 { 2.0 * t } else { t };
+        if horizontal {
+            let (top, a) = (start(cy, w), start(cx, w));
+            if toward_end { rect(a, top, x1, top + w, fg) } else { rect(x0, top, a + w, top + w, fg) }
+        } else {
+            let (side, a) = (start(cx, w), start(cy, w));
+            if toward_end { rect(side, a, side + w, y1, fg) } else { rect(side, y0, side + w, a + w, fg) }
+        }
+    }
+
+    // Double arms: two light lines with their middles at `cx ± t` (vertical) or `cy ± t` (horizontal).
+    // At a corner or a T, each line stops at the line of the double arm across it: the outer line at the outer line,
+    // the inner line at the inner line. With no double arm across it, the line stops in the middle of the cell.
+    // `near` is the line across on the same side, `far` the line across on the other side.
+    let stop = |center: f32, near: bool, far: bool, toward_end: bool| -> f32 {
+        let line = match (near, far) {
+            (true, _) => if toward_end { center + t } else { center - t },
+            (false, true) => if toward_end { center - t } else { center + t },
+            _ => center,
+        };
+        if toward_end { start(line, t) } else { start(line, t) + t }
+    };
+    for (line, upper) in [(cy - t, true), (cy + t, false)] {
+        let top = start(line, t);
+        // The double vertical arm on the side of this line (above for the upper line), and on the other side.
+        let (near, far) = if upper { (up == 3, down == 3) } else { (down == 3, up == 3) };
+        if right == 3 {
+            rect(stop(cx, near, far, true), top, x1, top + t, fg);
+        }
+        if left == 3 {
+            rect(x0, top, stop(cx, near, far, false), top + t, fg);
+        }
+    }
+    for (line, on_left) in [(cx - t, true), (cx + t, false)] {
+        let side = start(line, t);
+        let (near, far) = if on_left { (left == 3, right == 3) } else { (right == 3, left == 3) };
+        if down == 3 {
+            rect(side, stop(cy, near, far, true), side + t, y1, fg);
+        }
+        if up == 3 {
+            rect(side, y0, side + t, stop(cy, near, far, false), fg);
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    fn rects(c: char, x: f32) -> Vec<(f32, f32, f32, f32)> {
+        let mut out = Vec::new();
+        assert!(cell_shape(c, x, 0.0, 8.4, 17.0, [255; 3], [0; 3], &mut |a, b, c, d, _| out.push((a, b, c, d))));
+        out
+    }
+
+    #[test]
+    fn box_lines_reach_the_cell_edges() {
+        // A horizontal line ends at the edge where the next cell starts its line, so there is no gap.
+        let right_edge = rects('\u{2500}', 0.0).iter().map(|r| r.2).fold(0.0, f32::max);
+        let left_edge = rects('\u{2500}', 8.4).iter().map(|r| r.0).fold(f32::MAX, f32::min);
+        assert_eq!(right_edge, left_edge);
+        // A vertical line covers the full height.
+        let v = rects('\u{2502}', 0.0);
+        assert!(v.iter().any(|r| r.1 == 0.0) && v.iter().any(|r| r.3 == 17.0));
+        // The full block fills the cell.
+        assert_eq!(rects('\u{2588}', 0.0), vec![(0.0, 0.0, 8.0, 17.0)]);
+        // A double corner has two lines in each of its two arms. The outer lines meet: the upper line of the
+        // right arm starts at the left line of the down arm.
+        let corner = rects('\u{2554}', 0.0);
+        assert_eq!(corner.len(), 4);
+        let (upper, left) = (corner[0], corner[2]);
+        assert_eq!(upper.0, left.0, "{corner:?}");
+        // Other characters are for the font.
+        assert!(!cell_shape('a', 0.0, 0.0, 8.0, 16.0, [0; 3], [0; 3], &mut |_, _, _, _, _| {}));
+        assert!(!cell_shape('\u{2571}', 0.0, 0.0, 8.0, 16.0, [0; 3], [0; 3], &mut |_, _, _, _, _| {}));
+    }
 }

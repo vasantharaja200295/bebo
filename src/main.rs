@@ -2559,6 +2559,16 @@ impl ApplicationHandler<UserEvent> for App {
                 next = Some(next.map_or(due, |n| n.min(due)));
             }
         }
+        // A frame that the window did not show (covered or hidden) is drawn again 100 ms later, until one frame shows.
+        // Windows does not ask for a frame when the window shows again, so it would keep its old content.
+        if self.gpu.as_ref().is_some_and(|g| g.missed) {
+            let due = self.last_frame + Duration::from_millis(100);
+            if due <= now {
+                self.redraw();
+            } else {
+                next = Some(next.map_or(due, |n| n.min(due)));
+            }
+        }
         event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 }

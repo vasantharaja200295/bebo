@@ -739,3 +739,12 @@ With the settings of the test user (terminal font SF Mono, weight 500, interface
 7. **Administrator check.** The elevation of the process token, not `IsUserAnAdmin`, which loads shell32.dll.
 
 What remains: the NVIDIA OpenGL driver needs about 185 ms, and Windows PowerShell 5.1 needs about 200 ms to start (65 ms more for PSReadLine).
+
+## 27. Box drawing and the cell grid (2026-11-19)
+
+Neovim (LazyVim) showed two faults that Windows Terminal does not have.
+
+- **Box drawing and blocks.** The glyphs of U+2500 to U+259F in a font often do not fill the cell, so lines had gaps and the LazyVim logo broke apart. bebo now draws these characters as rectangles on whole pixels (`cell_shape` in `ui.rs`), as other terminals do. Each line character has four arms (up, right, down, left), each none, light, heavy, or double. The lines of a double arm stop at the matching line of the double arm across them. Rounded corners are square corners; the three diagonals stay with the font. A unit test checks that the lines meet at the cell edges.
+- **Cell grid.** A character from a fallback font (an icon, a symbol, a letter with an accent) has another width, and the text after it in the same row moved off the grid. Each character that is not ASCII is now a separate text row at its cell, as wide characters were already. ASCII text keeps its runs, because ASCII has the width of the cell in the terminal font.
+- **Skipped frames.** A frame that the window did not show (`Occluded` or `Timeout`) is drawn again 100 ms later, until one shows.
+- Test note: with the display off (power plan: 3 minutes), Windows does not compose new GPU frames, and a capture shows an old image. Check that the display is on before a visual test.

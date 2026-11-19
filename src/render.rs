@@ -184,6 +184,8 @@ pub struct Gpu {
     ui: String,
     /// Weight of the terminal font, 100 to 900. Bold text is 300 heavier.
     weight: u16,
+    /// The last frame did not show (the window was covered or hidden). The App draws it again.
+    pub missed: bool,
     /// Images as RGBA pixels. The key is the image id and the size in pixels (the images are squares).
     images: HashMap<(u16, u16), Vec<u8>>,
     /// Shaped text for each row content. The key is the hash of the row.
@@ -299,6 +301,7 @@ impl Gpu {
             cached: from_list.into_iter().collect(),
             ui,
             weight: 400,
+            missed: false,
             images: HashMap::new(),
             row_cache: HashMap::new(),
             frame_number: 0,
@@ -642,8 +645,15 @@ impl Gpu {
         prof::add("render: text+vertices", t0);
         let t1 = std::time::Instant::now();
         let surface_texture = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            wgpu::CurrentSurfaceTexture::Success(texture) => {
+                self.missed = false;
+                texture
+            },
+            // The App draws this frame again later (see `missed`).
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                self.missed = true;
+                return;
+            },
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
                 self.surface.configure(&self.device, &self.config);
                 self.window.request_redraw();
